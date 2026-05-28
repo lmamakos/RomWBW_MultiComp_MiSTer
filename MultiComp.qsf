@@ -28,7 +28,7 @@ set_global_assignment -name PARTITION_NETLIST_TYPE SOURCE -section_id Top
 set_global_assignment -name PARTITION_FITTER_PRESERVATION_LEVEL PLACEMENT_AND_ROUTING -section_id Top
 set_global_assignment -name PARTITION_COLOR 16764057 -section_id Top
 
-set_global_assignment -name LAST_QUARTUS_VERSION "17.0.2 Standard Edition"
+set_global_assignment -name LAST_QUARTUS_VERSION "17.0.2 Lite Edition"
 
 set_global_assignment -name GENERATE_RBF_FILE ON
 set_global_assignment -name PROJECT_OUTPUT_DIRECTORY output_files
@@ -302,7 +302,6 @@ set_global_assignment -name CDF_FILE jtag.cdf
 set_global_assignment -name QIP_FILE sys/sys.qip
 set_global_assignment -name QIP_FILE rtl/pll.qip
 set_global_assignment -name SYSTEMVERILOG_FILE MultiComp.sv
-set_global_assignment -name VHDL_FILE Components/M6809/cpu09l.vhd
 set_global_assignment -name VHDL_FILE Components/TERMINAL/SBCTextDisplayRGB.vhd
 set_global_assignment -name VHDL_FILE Components/M6800/cpu68.vhd
 set_global_assignment -name VHDL_FILE Components/Z80/T80s.vhd
@@ -313,26 +312,16 @@ set_global_assignment -name VHDL_FILE Components/Z80/T80_ALU.vhd
 set_global_assignment -name VHDL_FILE Components/Z80/T80.vhd
 set_global_assignment -name VHDL_FILE Components/TERMINAL/CGABoldRom.vhd
 set_global_assignment -name VHDL_FILE Components/UART/bufferedUART.vhd
-set_global_assignment -name VHDL_FILE Components/M6502/T65_Pack.vhd
-set_global_assignment -name VHDL_FILE Components/M6502/T65_MCode.vhd
-set_global_assignment -name VHDL_FILE Components/M6502/T65_ALU.vhd
-set_global_assignment -name VHDL_FILE Components/M6502/T65.vhd
 set_global_assignment -name VHDL_FILE Components/SDCARD/sd_controller.vhd
 set_global_assignment -name VHDL_FILE Components/SDCARD/image_controller.vhd
-set_global_assignment -name QIP_FILE ROMS/6502/M6502_BASIC_ROM.qip
 set_global_assignment -name QIP_FILE ROMS/Z80/Z80_BASIC_ROM.qip
 set_global_assignment -name QIP_FILE Components/TERMINAL/DisplayRam1K.qip
 set_global_assignment -name CDF_FILE output_files/m6502.cdf
 set_global_assignment -name QIP_FILE Components/INTERNALRAM/InternalRam64K.qip
 set_global_assignment -name QIP_FILE Components/TERMINAL/DisplayRam2K.qip
 set_global_assignment -name QIP_FILE Components/TERMINAL/CGABoldRomReduced.qip
-set_global_assignment -name QIP_FILE ROMS/6809/M6809_EXT_BASIC_ROM.qip
 set_global_assignment -name QIP_FILE ROMS/Z80/Z80_CPM_BASIC_ROM.qip
-set_global_assignment -name QIP_FILE ROMS/6809/M6809_CAMELFORTH_ROM.qip
 set_global_assignment -name VHDL_FILE MicrocomputerZ80CPM.vhd
-set_global_assignment -name VHDL_FILE Microcomputer6502Basic.vhd
-set_global_assignment -name VHDL_FILE Microcomputer6809Basic.vhd
-set_global_assignment -name VHDL_FILE Microcomputer6809Forth.vhd
 set_global_assignment -name VHDL_FILE MicrocomputerZ80Basic.vhd
 set_global_assignment -name SIGNALTAP_FILE "output_files/status13-stp1.stp"
 set_global_assignment -name SLD_FILE "db/status13-stp1_auto_stripped.stp"

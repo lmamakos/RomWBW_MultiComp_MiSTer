@@ -250,7 +250,7 @@ parameter CONF_STR = {
 	"S,IMG;",
 	"OF,Reset after Mount,No,Yes;", 
 	"-;",
-	"O68,CPU-ROM,Z80-CP/M,Z80-BASIC,6502-Basic,6809-Basic,6809-Forth;",
+	"O68,CPU-ROM,Z80-CP/M,Z80-BASIC;",
 	"-;",
 	"O9B,Baud Rate tty,115200,38400,19200,9600,4800,2400;",
 	"OC,Serial Port,Console Port,User IO Port;",
@@ -501,7 +501,7 @@ assign user_cts_en 	= USER_OUT[3];
 
 assign CLK_VIDEO = clk_sys;
 
-typedef enum {cpuZ80CPM='b000, cpuZ80Basic='b001, cpu6502Basic='b010, cpu6809Basic='b011, cpu6809Forth='b100} cpu_type_enum;
+typedef enum {cpuZ80CPM='b000, cpuZ80Basic='b001} cpu_type_enum;
 wire [2:0] cpu_type = status[8:6];
 
 typedef enum {baud115200='b000, baud38400='b001, baud19200='b010, baud9600='b011, baud4800='b100, baud2400='b101} baud_rate_enum;
@@ -608,84 +608,6 @@ MicrocomputerZ80Basic MicrocomputerZ80Basic
     .cts1(serial_cts)
 );
 
-Microcomputer6502Basic Microcomputer6502Basic
-(
-    .N_RESET(~reset & cpu_type == cpu6502Basic),
-    .clk(cpu_type == cpu6502Basic ? clk_sys : 0),
-    .baud_increment(baud_increment),
-    .R(_r[cpu6502Basic][1:0]),
-    .G(_g[cpu6502Basic][1:0]),
-    .B(_b[cpu6502Basic][1:0]),
-    .HS(_hs[cpu6502Basic]),
-    .VS(_vs[cpu6502Basic]),
-    .hBlank(_hblank[cpu6502Basic]),
-    .vBlank(_vblank[cpu6502Basic]),
-    .cepix(_CE_PIXEL[cpu6502Basic]),
-    .ps2Clk(PS2_CLK),
-    .ps2Data(PS2_DAT),
-	.sdCS(_SD_CS[cpu6502Basic]),
-	.sdMOSI(_SD_MOSI[cpu6502Basic]),
-	.sdMISO(sdmiso),
-	.sdSCLK(_SD_SCK[cpu6502Basic]),
-    .driveLED(_driveLED[cpu6502Basic]),
-    .rxd1(serial_rx),
-    .txd1(_txd[cpu6502Basic]),
-    .rts1(_rts[cpu6502Basic]),
-    .cts1(serial_cts)
-);
-
-//Reset is not working (even on the original Grant's 6809)
-Microcomputer6809Basic Microcomputer6809Basic
-(
-    .N_RESET(~reset & cpu_type == cpu6809Basic),
-    .clk(cpu_type == cpu6809Basic ? clk_sys : 0),
-    .baud_increment(baud_increment),
-    .R(_r[cpu6809Basic][1:0]),
-    .G(_g[cpu6809Basic][1:0]),
-    .B(_b[cpu6809Basic][1:0]),
-    .HS(_hs[cpu6809Basic]),
-    .VS(_vs[cpu6809Basic]),
-    .hBlank(_hblank[cpu6809Basic]),
-    .vBlank(_vblank[cpu6809Basic]),
-    .cepix(_CE_PIXEL[cpu6809Basic]),
-    .ps2Clk(PS2_CLK),
-    .ps2Data(PS2_DAT),
-	.sdCS(_SD_CS[cpu6809Basic]),
-	.sdMOSI(_SD_MOSI[cpu6809Basic]),
-	.sdMISO(sdmiso),
-	.sdSCLK(_SD_SCK[cpu6809Basic]),
-    .driveLED(_driveLED[cpu6809Basic]),
-    .rxd1(serial_rx),
-    .txd1(_txd[cpu6809Basic]),
-    .rts1(_rts[cpu6809Basic]),
-    .cts1(serial_cts)
-);
-
-Microcomputer6809Forth Microcomputer6809Forth
-(
-    .N_RESET(~reset & cpu_type == cpu6809Forth),
-    .clk(cpu_type == cpu6809Forth ? clk_sys : 0),
-    .baud_increment(baud_increment),
-    .R(_r[cpu6809Forth][1:0]),
-    .G(_g[cpu6809Forth][1:0]),
-    .B(_b[cpu6809Forth][1:0]),
-    .HS(_hs[cpu6809Forth]),
-    .VS(_vs[cpu6809Forth]),
-    .hBlank(_hblank[cpu6809Forth]),
-    .vBlank(_vblank[cpu6809Forth]),
-    .cepix(_CE_PIXEL[cpu6809Forth]),
-    .ps2Clk(PS2_CLK),
-    .ps2Data(PS2_DAT),
-	.sdCS(_SD_CS[cpu6809Forth]),
-	.sdMOSI(_SD_MOSI[cpu6809Forth]),
-	.sdMISO(sdmiso),
-	.sdSCLK(_SD_SCK[cpu6809Forth]),
-    .driveLED(_driveLED[cpu6809Forth]),
-    .rxd1(serial_rx),
-    .txd1(_txd[cpu6809Forth]),
-    .rts1(_rts[cpu6809Forth]),
-    .cts1(serial_cts)
-);
 
 video_cleaner video_cleaner
 (
