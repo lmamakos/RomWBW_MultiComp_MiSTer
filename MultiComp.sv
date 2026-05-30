@@ -222,7 +222,40 @@ wire user_cts_en  = USER_OUT[3];    // Enable CTS input
 
 assign ADC_BUS  = 'Z;
 //assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
-assign {SDRAM_DQ, SDRAM_A, SDRAM_BA, SDRAM_CLK, SDRAM_CKE, SDRAM_DQML, SDRAM_DQMH, SDRAM_nWE, SDRAM_nCAS, SDRAM_nRAS, SDRAM_nCS} = 'Z;
+
+// 128 MB SDRAM (XSDS dual-AS4C32M16SB) controller instance. For now the
+// client side is idle (we=rd=0) so the controller only performs init and
+// refresh. The Z-80 still boots from FPGA block RAM. Wiring the MMU's
+// physical bus into this instance is the next integration step.
+//
+// Reset note: `reset` is declared further down in this module; this
+// instance refers to it forward. Verilog permits that for module ports.
+sdram_z80 sdram_z80_inst
+(
+	.init        (reset),
+	.clk         (clk_sys),
+
+	.SDRAM_DQ    (SDRAM_DQ),
+	.SDRAM_A     (SDRAM_A),
+	.SDRAM_DQML  (SDRAM_DQML),
+	.SDRAM_DQMH  (SDRAM_DQMH),
+	.SDRAM_BA    (SDRAM_BA),
+	.SDRAM_nCS   (SDRAM_nCS),
+	.SDRAM_nWE   (SDRAM_nWE),
+	.SDRAM_nRAS  (SDRAM_nRAS),
+	.SDRAM_nCAS  (SDRAM_nCAS),
+	.SDRAM_CKE   (SDRAM_CKE),
+	.SDRAM_CLK   (SDRAM_CLK),
+
+	// Idle client: no requests yet
+	.addr  (27'd0),
+	.din   (8'd0),
+	.dout  (),
+	.we    (1'b0),
+	.rd    (1'b0),
+	.ready ()
+);
+
 assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = 0;
 
 //assign UART_RTS = UART_CTS;

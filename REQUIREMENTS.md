@@ -71,17 +71,33 @@ accessing memory.
 
 ### Implement SDRAM
 
-Use the 128 Mbytes of SDRAM for the Z-80 system memory (via the MMU),
-rather than FPGA block ram.
+Use the 128 Mbytes of SDRAM (XSDS dual-AS4C32M16SB module, two 64 MB
+parts wired in parallel on a shared bus with the second physical chip
+select derived from board-side logic) for additional Z-80 system memory
+beyond the existing 64 KB of FPGA block RAM.
+
+Initial physical memory layout target:
+
+| Physical address | Contents |
+|---|---|
+| `0x0000_0000 – 0x0000_FFFF` | Existing 64 KB FPGA block RAM (unchanged) |
+| `0x0001_0000 – 0x07FF_FFFF` | 128 MB SDRAM (minus the bottom 64 KB which is shadowed by block RAM) |
+
+This lets the system continue booting from the proven block-RAM image
+while exposing SDRAM for testing. The MMU will eventually be inserted
+between the Z-80 and this layout; until it is, the SDRAM controller runs
+idle (no client) so that init/refresh of the parts can be verified
+independently.
 
 ## Progress
 
-### MMU rework (`Components/alancox/MMU.vhd`) — design complete, not yet in the build
+### MMU rework (`Components/alancox/MMU.vhd`) — design complete, GHDL-verified, not yet in the build
 
 The MMU source file has been rewritten in place to match the requirements
-above. The file is not yet referenced from either Quartus revision (no
-`.qsf` entries) and is not yet instantiated anywhere in the system, so the
-build is unaffected by the change.
+above. GHDL (`ghdl -a --std=08`) accepts the file with no errors.
+Elaboration of the entity also passes. The file is not yet referenced from
+either Quartus revision (no `.qsf` entries) and is not yet instantiated
+anywhere in the system, so the build is unaffected by the change.
 
 What the file now provides:
 
@@ -115,21 +131,68 @@ What the file now provides:
   K = 0..3, direct-access pointer = 0). Marked in source as TODO to be
   revisited once the physical ROM/SDRAM layout is decided.
 
+### SDRAM controller (`Components/SDRAM/sdram.sv` + `sdram_z80.sv`) — in the build, currently idle
+
+The 128 MB dual-chip SDRAM controller from the MiSTer N64 core
+(`MiSTer-devel/N64_MiSTer rtl/sdram.sv`, GPLv3, Sorgelig) has been adopted
+verbatim as `Components/SDRAM/sdram.sv`. The pre-existing 32 MB controllers
+that shipped in `Components/SDRAM/` (a single-port `sdram.sv` and a
+multi-port `sdram.v`) are no longer suitable for the 128 MB module and
+have been replaced/removed.
+
+Key behaviour of the adopted controller:
+
+- 27-bit byte address per channel, covering the full 128 MB.
+- Drives the single FPGA `SDRAM_nCS` from an internal `chip` register;
+  the XSDS board derives the two physical device chip-selects from that
+  line plus board-side routing. The controller selects device 0 vs 1 by
+  copying the top address bit (`chN_addr[26]`) into `chip` for each
+  ACTIVE/READ/WRITE, and walks `chip` 0 -> 1 during init and refresh so
+  both devices are configured and refreshed.
+- Three channels: ch1 (32-bit + byte enables), ch2 (32-bit), ch3 (16-bit).
+
+A thin 8-bit wrapper, `Components/SDRAM/sdram_z80.sv`, exposes a simple
+`addr/din/dout/we/rd/ready` interface and uses the controller's ch1
+channel (the only one with proper per-byte enables, allowing clean 8-bit
+writes). ch2 and ch3 are tied off. The wrapper also drives `SDRAM_CLK`
+via `altddio_out` since the controller intentionally leaves that to the
+integrator.
+
+The wrapper is instantiated in `MultiComp.sv` (replacing the previous
+`assign {SDRAM_*} = 'Z;` tri-state at line 225). For this phase the
+client side of the wrapper is held idle (`we = rd = 0`); the SDRAM is
+therefore initialized and refreshed but not yet read or written by the
+Z-80. The Z-80 still boots from the existing 64 KB FPGA block RAM as
+before.
+
+Both `MultiComp.qsf` and `MultiComp-lite.qsf` have been updated with
+`SYSTEMVERILOG_FILE` entries for the two new files. The SDRAM controller
+runs from the existing `clk_sys` (50 MHz from `rtl/pll.v`); the
+AS4C32M16SB timing constants in the controller comfortably hold at this
+frequency, so PLL regeneration is not required for first bring-up.
+
 ### Outstanding work toward the requirements above
 
-1. **Verify the rewritten MMU compiles** under Quartus (Analysis &
-   Elaboration). This has not been run yet.
+1. **Hardware bring-up of the SDRAM controller**: compile in Quartus,
+   load the bitstream, verify the SDRAM is being initialized and
+   refreshed (the controller's `chip` toggling should be observable, and
+   the parts should not enter their power-down/decay regime). No
+   functional test of read/write yet — that needs a client.
 2. **Wire the MMU into the system** (Requirement: "Implement MMU"). The
    MMU is not currently instantiated. Once it is wired in:
-   - Add `set_global_assignment -name VHDL_FILE
-     Components/alancox/MMU.vhd` to **both** `MultiComp.qsf` and
-     `MultiComp-lite.qsf` (per `AGENTS.md`).
+   - Add `set_global_assignment -name VHDL_FILE Components/alancox/MMU.vhd`
+     to **both** `MultiComp.qsf` and `MultiComp-lite.qsf` (per `AGENTS.md`).
    - Choose the base address for the 16-port I/O window (must be aligned
      on a 16-port boundary so the low 4 address bits are a clean
      in-window offset).
    - Decide whether `access_violated` needs to be re-introduced.
-3. **Use SDRAM as Z-80 system memory** (Requirement: "Implement SDRAM").
-   Route the MMU's physical address bus to the MiSTer SDRAM controller in
-   place of FPGA block RAM.
-4. **Revisit the reset map** once ROM and SDRAM physical placement is
-   fixed.
+3. **Connect the MMU to the layered memory** (Requirement: "Implement
+   SDRAM"). The MMU's physical address output picks between the existing
+   64 KB block RAM (when `address_out[26:16] == 0`) and the SDRAM
+   wrapper's `addr/we/rd/din/dout/ready` (otherwise). This is the step
+   that actually exercises SDRAM access.
+4. **Revisit the MMU reset map** once the layered memory is wired so the
+   identity map points at sensible regions (frame 0 at block RAM for
+   ROM/boot, etc.).
+5. **Optional**: move the SDRAM to a dedicated higher-frequency clock
+   (e.g. 100 MHz from a regenerated PLL) once basic operation is proven.
