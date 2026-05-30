@@ -8,8 +8,9 @@
 // https://github.com/MiSTer-devel/N64_MiSTer (Copyright (c) 2015-2019
 // Sorgelig, GPLv3), preserved here unchanged so that future updates from
 // upstream can be tracked. A thin 8-bit adapter for this project lives in
-// sdram_z80.sv and uses only the 16-bit ch3 channel; ch1/ch2 are tied off
-// for now.
+// sdram_z80.sv and uses the 32-bit ch1 channel (chosen because it is the
+// only channel with per-byte enables via ch1_be, which is required for
+// clean 8-bit writes); ch2 and ch3 are tied off for now.
 //
 // Key facts about how this controller handles the 128 MB dual-chip module:
 //   * It drives the single FPGA SDRAM_nCS pin from an internal `chip`
