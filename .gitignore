@@ -5,3 +5,9 @@ output_files/*
 **/pll_sim/*
 **/*.bak
 *~
+
+# GHDL work libraries (e.g. work-obj08.cf produced by `ghdl -a`)
+work-obj*.cf
+
+# AI assistant session transcripts
+session-ses_*.md
