@@ -89,6 +89,45 @@ between the Z-80 and this layout; until it is, the SDRAM controller runs
 idle (no client) so that init/refresh of the parts can be verified
 independently.
 
+## I/O port map (reference)
+
+A consolidated list of all I/O ports identified for use by this
+project so far. The "Core" column shows which Z-80 wrapper(s)
+currently decode the port (`CPM` = `MicrocomputerZ80CPM`,
+`Basic` = `MicrocomputerZ80Basic`). Ports marked "planned" are
+reserved by these requirements but not yet wired up in any wrapper.
+Entries should be kept in sync with the `n_*CS` decodes in the
+"CHIP SELECTS" section of each `Microcomputer*.vhd` wrapper.
+
+| Port(s)       | Width  | Core(s)   | Function                                                                                                  |
+|---------------|--------|-----------|-----------------------------------------------------------------------------------------------------------|
+| `0x20`-`0x21` | 2      | CPM       | CH376S USB module (`n_ch376sCS`). `0x20` data, `0x21` command (per `cpuAddress(0)`).                      |
+| `0x38`        | 1      | CPM       | ROM-disable trigger. Any write disables the boot ROM at `0x0000-0x1FFF` and exposes the RAM beneath it.   |
+| `0x47`        | 1      | CPM       | Front-panel data latch (R/W). Software writes drive the 8-bit transparent capture chain; reads return the last-written value. |
+| `0x80`-`0x81` | 2      | CPM, Basic| SBCTextDisplayRGB (`n_interface1CS`). VGA/PS-2 text display.                                              |
+| `0x82`-`0x83` | 2      | CPM, Basic| bufferedUART (`n_interface2CS`). Serial console.                                                          |
+| `0x88`-`0x8F` | 8      | CPM, Basic| SD card controller (`n_sdCardCS`). Register offset via `cpuAddress(2 downto 0)`.                          |
+| `0xA0`-`0xA7` | 8      | CPM       | Front-panel subsystem control window (`n_fpSubsysCS`). See Front-panel I/O register map below.            |
+| _TBD_         | 16     | _planned_ | MMU register window (16 consecutive ports, aligned on a 16-port boundary). Base address not yet chosen.   |
+
+### Front-panel subsystem register map (within the `0xA0`-`0xA7` window)
+
+Decoded by the `FrontPanel_Subsystem` block from `addr(2 downto 0)`
+relative to `io_cs`. Offsets are shown against the current base of
+`0xA0`; if the window is relocated later, software access addresses
+shift accordingly.
+
+| Port  | R/W | Function                                                                                                                                |
+|-------|-----|-----------------------------------------------------------------------------------------------------------------------------------------|
+| `0xA0`| R/W | Global brightness (0..255, 8-bit linear scale).                                                                                         |
+| `0xA1`| R/W | Fade rate (step per refresh tick).                                                                                                      |
+| `0xA2`| R/W | Global pointer (LED index used by `0xA3`, `0xA5`, `0xA6`).                                                                              |
+| `0xA3`| W   | Colour stream. Six bytes per LED: on-G, on-R, on-B, off-G, off-R, off-B. The sixth byte auto-advances the global pointer.               |
+| `0xA4`| R/W | Mode register. Bit 0: 0 = mirror capture chain, 1 = framebuffer.                                                                        |
+| `0xA5`| R/W | Mapping-table entry at the global pointer. Both reads and writes auto-advance the pointer.                                              |
+| `0xA6`| R/W | Framebuffer bit at the global pointer. Both reads and writes auto-advance the pointer.                                                  |
+| `0xA7`| --  | Reserved (reads 0, writes ignored).                                                                                                     |
+
 ## Progress
 
 ### MMU rework (`Components/alancox/MMU.vhd`) — design complete, GHDL-verified, not yet in the build
@@ -171,6 +210,38 @@ runs from the existing `clk_sys` (50 MHz from `rtl/pll.v`); the
 AS4C32M16SB timing constants in the controller comfortably hold at this
 frequency, so PLL regeneration is not required for first bring-up.
 
+### Front-panel LED subsystem (`Components/FRONTPANEL/`) — wired into the CPM core for initial bring-up
+
+The WS2812/SK6812-based blinkenlights front panel has been added to the
+build of the Z-80 CPM core. Files are referenced from both
+`MultiComp.qsf` and `MultiComp-lite.qsf`; the subsystem and capture
+chain are instantiated in `MicrocomputerZ80CPM.vhd`.
+
+Initial configuration:
+
+- **I/O port 0x47** (`n_fpLatchCS`): 8-bit R/W latch. Software writes
+  set the bit pattern displayed on the front panel; reads return the
+  last-written value.
+- **I/O ports 0xA0..0xA7** (`n_fpSubsysCS`): the `FrontPanel_Subsystem`
+  8-port control window (brightness, fade rate, pointer, colour stream,
+  mode, mapping table, framebuffer, reserved).
+- **`Transparent_Capture_Chain` (8 bits wide)**: sources its
+  `combined_data` from the port 0x47 latch and delivers it on the
+  serial chain into `FrontPanel_Subsystem`.
+- **NUM_LEDS = 16** for first bring-up. The default identity mapping
+  (mapping.mif) maps LED i to chain bit i; with an 8-bit chain only
+  LEDs 0..7 mirror the port-0x47 latch, while LEDs 8..15 mirror chain
+  bit positions that have not been written and therefore stay at
+  reset value (0 = off colour). Software can rewrite the mapping
+  table at runtime to point any LED at any chain bit.
+- **Refresh tick** generated locally at ~60 Hz from `clk` (50 MHz /
+  833_333).
+- **Physical output**: `MultiComp.sv` routes the WS2812 serial line
+  through `USER_OUT[4]` of the MiSTer USER_IO port. The Basic core's
+  matching pin is tied to `'0'` (no front panel in Basic mode for
+  now); the existing cpu_type mux selects which core's signal reaches
+  the pin.
+
 ### Outstanding work toward the requirements above
 
 1. **Hardware bring-up of the SDRAM controller**: compile in Quartus,
@@ -178,7 +249,13 @@ frequency, so PLL regeneration is not required for first bring-up.
    refreshed (the controller's `chip` toggling should be observable, and
    the parts should not enter their power-down/decay regime). No
    functional test of read/write yet — that needs a client.
-2. **Wire the MMU into the system** (Requirement: "Implement MMU"). The
+2. **Hardware bring-up of the front panel**: compile and load,
+   confirm the WS2812 string lights up with the default identity map
+   when software writes patterns to port 0x47, exercise the colour
+   stream at port 0xA3 (six bytes per LED, on-G/R/B then off-G/R/B),
+   confirm the brightness scaler at port 0xA0 dims/brightens, and
+   confirm the framebuffer mode at port 0xA4 + 0xA6.
+3. **Wire the MMU into the system** (Requirement: "Implement MMU"). The
    MMU is not currently instantiated. Once it is wired in:
    - Add `set_global_assignment -name VHDL_FILE Components/alancox/MMU.vhd`
      to **both** `MultiComp.qsf` and `MultiComp-lite.qsf` (per `AGENTS.md`).
@@ -186,13 +263,18 @@ frequency, so PLL regeneration is not required for first bring-up.
      on a 16-port boundary so the low 4 address bits are a clean
      in-window offset).
    - Decide whether `access_violated` needs to be re-introduced.
-3. **Connect the MMU to the layered memory** (Requirement: "Implement
+4. **Connect the MMU to the layered memory** (Requirement: "Implement
    SDRAM"). The MMU's physical address output picks between the existing
    64 KB block RAM (when `address_out[26:16] == 0`) and the SDRAM
    wrapper's `addr/we/rd/din/dout/ready` (otherwise). This is the step
    that actually exercises SDRAM access.
-4. **Revisit the MMU reset map** once the layered memory is wired so the
+5. **Revisit the MMU reset map** once the layered memory is wired so the
    identity map points at sensible regions (frame 0 at block RAM for
    ROM/boot, etc.).
-5. **Optional**: move the SDRAM to a dedicated higher-frequency clock
+6. **Expand the front-panel capture chain**: once the basic 8-bit
+   chain proves out, add a wider `Transparent_Capture_Chain` (or a
+   `Universal_Capture_Chain` with `STRETCH_MASK` set on a few control
+   bits) sourced from CPU/MMU/SDRAM control signals to drive a real
+   blinkenlights display.
+7. **Optional**: move the SDRAM to a dedicated higher-frequency clock
    (e.g. 100 MHz from a regenerated PLL) once basic operation is proven.

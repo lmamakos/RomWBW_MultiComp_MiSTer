@@ -65,7 +65,14 @@ entity MicrocomputerZ80CPM is
 		usbCS			: out std_logic;
 		usbMOSI			: out std_logic;
 		usbMISO			: in std_logic;
-		usbSCLK			: out std_logic
+		usbSCLK			: out std_logic;
+
+		-- Front-panel WS2812/SK6812 single-wire serial output. Initial
+		-- integration: 8 bits latched from I/O port 0x47 drive an 8-bit
+		-- transparent capture chain into the FrontPanel_Subsystem,
+		-- which then shifts a single-wire colour stream out to the LED
+		-- string.
+		fpLED_serial	: out std_logic
 		);
 end MicrocomputerZ80CPM;
 
@@ -87,6 +94,8 @@ architecture struct of MicrocomputerZ80CPM is
 	signal interface2DataOut		: std_logic_vector(7 downto 0);
 	signal ch376sDataOut			: std_logic_vector(7 downto 0);
 	signal sdCardDataOut			: std_logic_vector(7 downto 0);
+	signal fpLatchDataOut			: std_logic_vector(7 downto 0);
+	signal fpSubsysDataOut			: std_logic_vector(7 downto 0);
 
 	signal n_memWR					: std_logic :='1';
 	signal n_memRD 					: std_logic :='1';
@@ -108,6 +117,23 @@ architecture struct of MicrocomputerZ80CPM is
 	signal n_interface2CS			: std_logic :='1';
 	signal n_ch376sCS				: std_logic :='1';
 	signal n_sdCardCS				: std_logic :='1';
+	signal n_fpLatchCS				: std_logic :='1';   -- I/O port 0x47 latch
+	signal n_fpSubsysCS				: std_logic :='1';   -- FrontPanel_Subsystem 8-port window at 0xA0..0xA7
+
+	-- Front-panel latch holding the 8 bits driven onto the capture chain.
+	signal fpLatch					: std_logic_vector(7 downto 0) := (others => '0');
+
+	-- Front-panel refresh tick: ~60 Hz pulse (one clk-wide) generated
+	-- from the 50 MHz system clock to drive a frame of LED updates.
+	-- 50_000_000 / 60 = 833_333 cycles per tick.
+	signal fpRefreshCount			: unsigned(19 downto 0) := (others => '0');
+	signal fpRefreshTick			: std_logic := '0';
+
+	-- Capture-chain wires from the Transparent_Capture_Chain back to
+	-- the FrontPanel_Subsystem.
+	signal fpChainSerial			: std_logic;
+	signal fpChainLatch				: std_logic;
+	signal fpChainShiftEn			: std_logic;
 
     signal serialClkCount           : unsigned(15 downto 0);
 	signal cpuClkCount				: std_logic_vector(5 downto 0); 
@@ -302,6 +328,88 @@ port map (
 	clk 	=> 	sdClock -- twice the spi clk
 );
 
+-- ____________________________________________________________________________________
+-- FRONT PANEL GOES HERE
+
+-- Port 0x47: 8-bit R/W latch. Software writes set the bit pattern
+-- driven onto the front-panel transparent capture chain. Reads return
+-- the last-written value.
+process(clk)
+begin
+	if rising_edge(clk) then
+		if N_RESET = '0' then
+			fpLatch <= (others => '0');
+		elsif n_fpLatchCS = '0' and n_ioWR = '0' then
+			fpLatch <= cpuDataOut;
+		end if;
+	end if;
+end process;
+fpLatchDataOut <= fpLatch;
+
+-- ~60 Hz refresh tick (one clk cycle wide) from the 50 MHz system
+-- clock. 50_000_000 / 60 = 833_333. The fpRefreshCount comparison
+-- against the integer literal works under the std_logic_arith
+-- package family used throughout this wrapper.
+process(clk)
+begin
+	if rising_edge(clk) then
+		if N_RESET = '0' then
+			fpRefreshCount <= (others => '0');
+			fpRefreshTick  <= '0';
+		elsif fpRefreshCount = 833333-1 then
+			fpRefreshCount <= (others => '0');
+			fpRefreshTick  <= '1';
+		else
+			fpRefreshCount <= fpRefreshCount + 1;
+			fpRefreshTick  <= '0';
+		end if;
+	end if;
+end process;
+
+-- 8-bit transparent capture chain sourced from the fpLatch register.
+fpChain : entity work.Transparent_Capture_Chain
+	generic map (
+		TOTAL_WIDTH => 8
+	)
+	port map (
+		clk           => clk,
+		reset         => not N_RESET,
+		latch         => fpChainLatch,
+		shift_en      => fpChainShiftEn,
+		combined_data => fpLatch,
+		chain_in      => '0',
+		chain_out     => fpChainSerial
+	);
+
+-- Front-panel controller. The 8-port window lives at $A0..$A7 in the
+-- Z-80 I/O space (n_fpSubsysCS). NUM_LEDS is set to 16 for the initial
+-- bring-up so the entire string is reachable by the default identity
+-- mapping while leaving headroom to test the software framebuffer
+-- mode through ports +5/+6.
+fpSubsys : entity work.FrontPanel_Subsystem
+	generic map (
+		NUM_LEDS => 16,
+		SYS_CLK  => 50000000
+	)
+	port map (
+		clk          => clk,
+		reset        => not N_RESET,
+		refresh_tick => fpRefreshTick,
+
+		iorq_n       => n_IORQ,
+		wr_n         => n_WR,
+		rd_n         => n_RD,
+		io_cs        => not n_fpSubsysCS,
+		addr         => cpuAddress(7 downto 0),
+		din          => cpuDataOut,
+		dout         => fpSubsysDataOut,
+
+		latch        => fpChainLatch,
+		shift_en     => fpChainShiftEn,
+		chain_in     => fpChainSerial,
+
+		led_serial   => fpLED_serial
+	);
 
 -- ____________________________________________________________________________________
 -- MEMORY READ/WRITE LOGIC GOES HERE
@@ -319,6 +427,8 @@ n_interface1CS <= '0' when cpuAddress(7 downto 1) = "1000000" and (n_ioWR='0' or
 n_interface2CS <= '0' when cpuAddress(7 downto 1) = "1000001" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 2 Bytes $82-$83
 n_ch376sCS <= '0' when cpuAddress(7 downto 1) = "0010000" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 2 Bytes $20-$21
 n_sdCardCS <= '0' when cpuAddress(7 downto 3) = "10001" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 8 Bytes $88-$8F
+n_fpLatchCS <= '0' when cpuAddress(7 downto 0) = x"47" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 1 Byte $47 (front-panel data latch)
+n_fpSubsysCS <= '0' when cpuAddress(7 downto 3) = "10100" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 8 Bytes $A0-$A7 (front-panel subsystem)
 n_internalRam1CS <= not n_basRomCS; -- Full Internal RAM - 64 K
 
 -- ____________________________________________________________________________________
@@ -329,6 +439,8 @@ n_internalRam1CS <= not n_basRomCS; -- Full Internal RAM - 64 K
                  interface2DataOut when (n_interface2CS = '0') else
                  ch376sDataOut when (n_ch376sCS = '0') else
                  sdCardDataOut when (n_sdCardCS = '0') else
+                 fpLatchDataOut when (n_fpLatchCS = '0') else
+                 fpSubsysDataOut when (n_fpSubsysCS = '0') else
                  basRomData when (n_basRomCS = '0') else
                  internalRam1DataOut when (n_internalRam1CS = '0') else
                  sramData when (n_externalRamCS = '0') else

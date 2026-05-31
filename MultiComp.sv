@@ -515,13 +515,16 @@ assign UART_TXD = serial_port_select ? 1'b1 : serial_tx;
 assign UART_RTS = (serial_port_select || !flow_control_enable) ? 1'b1 : serial_rts;
 
 
-// USER_IO port control - single assignment for all outputs
+// USER_IO port control - single assignment for all outputs.
+// USER_OUT[4] carries the front-panel WS2812 single-wire serial line
+// (driven only by the CPM core for now; Basic ties it to '0').
 assign USER_OUT = {
-    3'b0,          // [6:4] unused
-    serial_port_select && flow_control_enable,    // [3] CTS input enable
-    (serial_port_select && flow_control_enable) ? serial_rts : 1'b1,    // [2] RTS output
-    serial_port_select ? serial_tx : 1'b1,    // [1] TX output
-    serial_port_select     // [0] RX input enable
+    2'b0,                                                              // [6:5] unused
+    fpLED_serial,                                                      // [4] front-panel WS2812 data
+    serial_port_select && flow_control_enable,                         // [3] CTS input enable
+    (serial_port_select && flow_control_enable) ? serial_rts : 1'b1,   // [2] RTS output
+    serial_port_select ? serial_tx : 1'b1,                             // [1] TX output
+    serial_port_select                                                 // [0] RX input enable
 };
 
 // Connect the read-only signals to the USER_OUT bits for monitoring
@@ -555,6 +558,8 @@ wire [4:0] _SD_MOSI;
 wire [4:0] _SD_SCK;
 wire [4:0] _txd;
 wire [4:0] _rts;  // RTS signals from CPUs
+wire [4:0] _fpLED_serial;  // Front-panel WS2812 line per CPU
+wire       fpLED_serial;   // Selected by cpu_type, routed to USER_OUT[4]
 
 
 // Add baud rate selection logic
@@ -587,6 +592,7 @@ begin
 	driveLED 	<= _driveLED[cpu_type];
     serial_tx   <= _txd[cpu_type];
     serial_rts  <= _rts[cpu_type];
+    fpLED_serial <= _fpLED_serial[cpu_type];
 end
 
 MicrocomputerZ80CPM MicrocomputerZ80CPM
@@ -612,7 +618,8 @@ MicrocomputerZ80CPM MicrocomputerZ80CPM
     .rxd1(serial_rx),
     .txd1(_txd[cpuZ80CPM]),
     .rts1(_rts[cpuZ80CPM]),
-    .cts1(serial_cts)
+    .cts1(serial_cts),
+    .fpLED_serial(_fpLED_serial[cpuZ80CPM])
 );
 
 MicrocomputerZ80Basic MicrocomputerZ80Basic
@@ -638,7 +645,8 @@ MicrocomputerZ80Basic MicrocomputerZ80Basic
     .rxd1(serial_rx),
     .txd1(_txd[cpuZ80Basic]),
     .rts1(_rts[cpuZ80Basic]),
-    .cts1(serial_cts)
+    .cts1(serial_cts),
+    .fpLED_serial(_fpLED_serial[cpuZ80Basic])
 );
 
 

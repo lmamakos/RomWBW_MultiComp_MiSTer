@@ -358,6 +358,10 @@ set_global_assignment -name QIP_FILE sys/sys.qip
 set_global_assignment -name SYSTEMVERILOG_FILE MultiComp.sv
 set_global_assignment -name SYSTEMVERILOG_FILE Components/SDRAM/sdram.sv
 set_global_assignment -name SYSTEMVERILOG_FILE Components/SDRAM/sdram_z80.sv
+set_global_assignment -name VHDL_FILE Components/FRONTPANEL/FP_RAM_Store.vhd
+set_global_assignment -name VHDL_FILE Components/FRONTPANEL/Transparent_Capture_Chain.vhd
+set_global_assignment -name VHDL_FILE Components/FRONTPANEL/Universal_Capture_Chain.vhd
+set_global_assignment -name VHDL_FILE Components/FRONTPANEL/FrontPanel_Subsystem.vhd
 set_global_assignment -name VHDL_FILE Components/Z80/T80s.vhd
 set_global_assignment -name VHDL_FILE Components/Z80/T80_Reg.vhd
 set_global_assignment -name VHDL_FILE Components/Z80/T80_Pack.vhd

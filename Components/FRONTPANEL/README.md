@@ -1,18 +1,19 @@
 # Front Panel Interface
 
-> **Status (2026-05):** Initial VHDL implementation reviewed and updated
-> in place. The front panel subsystem is not yet wired into the build
-> (no `.qsf` entries, no instantiation in `MultiComp.sv`). All VHDL
-> files analyze cleanly under GHDL VHDL-2008. The PHY timing tracks
-> the `SYS_CLK` generic, the I/O port-decoder process has a full reset
-> clause, `STRETCH_MASK` is explicitly width-checked, the
-> `mapping.mif` / `colors.mif` initialization files are valid MIF with
-> documented defaults, and the I/O port window is decoded relative to
-> an external `io_cs` chip-select (same pattern as the MMU) so the
-> integrator places the 8-port window anywhere in the Z-80 I/O space.
-> A `Transparent_Capture_Chain` variant is provided alongside
-> `Universal_Capture_Chain` for chains that do not need pulse
-> stretching.
+> **Status (2026-05):** Initial integration done. The front-panel
+> subsystem is now wired into the `MicrocomputerZ80CPM` core with a
+> single 8-bit `Transparent_Capture_Chain` sourced from a new R/W
+> latch at I/O port 0x47, and the subsystem's 8-port control window
+> occupies I/O ports 0xA0..0xA7. The WS2812 serial line emerges on
+> `USER_OUT[4]` of the MiSTer USER_IO port. The two new VHDL files
+> (`FP_RAM_Store`, `Transparent_Capture_Chain`, `Universal_Capture_Chain`,
+> `FrontPanel_Subsystem`) are referenced from both `MultiComp.qsf` and
+> `MultiComp-lite.qsf`. All four files analyze cleanly under GHDL
+> VHDL-2008. The PHY timing tracks the `SYS_CLK` generic, the I/O
+> port-decoder process has a full reset clause, `STRETCH_MASK` is
+> explicitly width-checked, and the I/O port window is decoded
+> relative to an external `io_cs` chip-select (same pattern as the
+> MMU). Hardware bring-up not yet attempted.
 
 ## Ultimate front panel light display
 

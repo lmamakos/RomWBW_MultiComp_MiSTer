@@ -60,7 +60,13 @@ entity MicrocomputerZ80Basic is
 		sdMOSI		: out std_logic;
 		sdMISO		: in std_logic;
 		sdSCLK		: out std_logic;
-		driveLED		: out std_logic :='1'	
+		driveLED		: out std_logic :='1';
+
+		-- Front-panel WS2812 single-wire output. Not driven in Basic
+		-- mode (front panel is wired only in the CPM core for now);
+		-- tied to '0' in the architecture so the top-level mux
+		-- between the two cores has a well-defined value.
+		fpLED_serial	: out std_logic
 	);
 end MicrocomputerZ80Basic;
 
@@ -110,6 +116,10 @@ architecture struct of MicrocomputerZ80Basic is
 	signal sdClock						: std_logic;
 
 begin
+
+-- Front-panel WS2812 line is not driven in the Basic core for now.
+-- Drive constant '0' so the top-level mux has a defined value.
+fpLED_serial <= '0';
 
 process(clk)
 begin

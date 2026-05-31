@@ -298,6 +298,10 @@ set_global_assignment -name USE_SIGNALTAP_FILE "output_files/status13-stp1.stp"
 set_global_assignment -name SYSTEMVERILOG_FILE Components/SDCARD/image_card.sv
 set_global_assignment -name SYSTEMVERILOG_FILE Components/SDRAM/sdram.sv
 set_global_assignment -name SYSTEMVERILOG_FILE Components/SDRAM/sdram_z80.sv
+set_global_assignment -name VHDL_FILE Components/FRONTPANEL/FP_RAM_Store.vhd
+set_global_assignment -name VHDL_FILE Components/FRONTPANEL/Transparent_Capture_Chain.vhd
+set_global_assignment -name VHDL_FILE Components/FRONTPANEL/Universal_Capture_Chain.vhd
+set_global_assignment -name VHDL_FILE Components/FRONTPANEL/FrontPanel_Subsystem.vhd
 set_global_assignment -name VERILOG_FILE Components/USB/spi_master_simple.v
 set_global_assignment -name VERILOG_FILE Components/USB/ch376s.v
 set_global_assignment -name CDF_FILE jtag.cdf
