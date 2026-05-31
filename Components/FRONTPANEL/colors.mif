@@ -1,0 +1,22 @@
+-- Front-panel LED on/off colour table.
+--
+-- Each 48-bit entry holds the "on" colour in the upper 24 bits and the
+-- "off" colour in the lower 24 bits. The 24-bit colour fields are in
+-- GRB byte order to match the WS2812 / SK6812 wire protocol: byte 0
+-- (bits 23:16) is Green, byte 1 (bits 15:8) is Red, byte 2 (bits 7:0)
+-- is Blue. So a value of 0xFF0000 is full-bright green, 0x00FF00 is
+-- full-bright red, 0x0000FF is full-bright blue.
+--
+-- The reset default below is "dim green when off, bright green when on"
+-- for every LED (on  = 0xFF0000 = bright green,
+--                off = 0x100000 = dim green). This makes every LED
+-- visible at power-up so wiring can be confirmed; software can recolor
+-- individual LEDs at runtime via I/O port 0x13 (six bytes per LED,
+-- on-G, on-R, on-B, off-G, off-R, off-B).
+WIDTH=48;
+DEPTH=256;
+ADDRESS_RADIX=DEC;
+DATA_RADIX=HEX;
+CONTENT BEGIN
+    [0..255] : FF0000100000;
+END;
