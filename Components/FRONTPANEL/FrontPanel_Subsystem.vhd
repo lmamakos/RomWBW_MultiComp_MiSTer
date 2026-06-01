@@ -114,7 +114,10 @@ architecture rtl of FrontPanel_Subsystem is
     signal cur_alpha  : unsigned(7 downto 0);
     signal target_bit : std_logic;
     signal mult_op1, mult_op2 : signed(8 downto 0);
-    signal product            : signed(16 downto 0);
+    -- 9 x 9 -> 18-bit signed product. Only bits 15:8 are consumed
+    -- downstream (interpolation step and brightness scaling); bits
+    -- 17:16 are sign-extension and bits 7:0 are sub-byte precision.
+    signal product            : signed(17 downto 0);
     signal interp_rgb         : unsigned(23 downto 0);
     signal final_rgb          : std_logic_vector(23 downto 0);
     signal ch_idx             : integer range 0 to 2 := 0;
