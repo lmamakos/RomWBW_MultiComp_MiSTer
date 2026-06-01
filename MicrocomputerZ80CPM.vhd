@@ -72,7 +72,18 @@ entity MicrocomputerZ80CPM is
 		-- transparent capture chain into the FrontPanel_Subsystem,
 		-- which then shifts a single-wire colour stream out to the LED
 		-- string.
-		fpLED_serial	: out std_logic
+		fpLED_serial	: out std_logic;
+
+		-- SDRAM client interface. The Z-80's logical address is
+		-- translated by the on-core MMU; any physical address that
+		-- does not fall inside the low 64 KB block-RAM region exits
+		-- through these ports to the SDRAM controller in MultiComp.sv.
+		sdram_addr		: out std_logic_vector(26 downto 0);
+		sdram_din		: out std_logic_vector(7 downto 0);
+		sdram_we		: out std_logic;
+		sdram_rd		: out std_logic;
+		sdram_dout		: in  std_logic_vector(7 downto 0);
+		sdram_ready		: in  std_logic
 		);
 end MicrocomputerZ80CPM;
 
@@ -119,6 +130,44 @@ architecture struct of MicrocomputerZ80CPM is
 	signal n_sdCardCS				: std_logic :='1';
 	signal n_fpLatchCS				: std_logic :='1';   -- I/O port 0x47 latch
 	signal n_fpSubsysCS				: std_logic :='1';   -- FrontPanel_Subsystem 8-port window at 0xA0..0xA7
+	signal n_mmuCS					: std_logic :='1';   -- MMU 16-port window at 0xB0..0xBF
+
+	-- MMU plumbing. The MMU translates the Z-80's 16-bit logical address
+	-- into a 22-bit physical address (physical_page_bits = 8 default).
+	-- The same block exposes the four mapping registers, a 32-bit
+	-- direct-access pointer, and a direct-access data port, all through
+	-- an external chip-select (mmu_io_cs) tied to the 0xB0..0xBF window.
+	signal mmu_phys_addr			: std_logic_vector(21 downto 0);
+	signal mmu_dataOut				: std_logic_vector(7 downto 0);
+	signal mmu_io_cs				: std_logic;
+	signal mmu_req_mem_in			: std_logic;
+	signal mmu_req_io_in			: std_logic;
+	signal mmu_req_read				: std_logic;
+	signal mmu_req_write			: std_logic;
+	signal mmu_req_mem_out			: std_logic;
+	signal mmu_req_io_out			: std_logic;
+	signal mmu_cpu_wait				: std_logic;
+	signal mmu_reset				: std_logic;
+
+	-- Physical-memory decode: the low 64 KB of physical address space
+	-- (phys_addr(21:16) = "000000") is covered by the on-chip block RAM.
+	-- Everything else routes to SDRAM.
+	signal phys_in_blockram			: std_logic;
+	signal phys_in_sdram			: std_logic;
+
+	-- SDRAM client FSM. The CPU is stalled via wait_n until the SDRAM
+	-- controller pulses `ready`. Reads latch dout into sdramReadData
+	-- for the cpuDataIn mux.
+	type sdram_state_t is (S_IDLE, S_REQ, S_DONE);
+	signal sdram_state				: sdram_state_t := S_IDLE;
+	signal sdram_we_reg				: std_logic := '0';
+	signal sdram_rd_reg				: std_logic := '0';
+	signal sdramReadData			: std_logic_vector(7 downto 0) := (others => '0');
+	signal sdram_wait_n				: std_logic := '1';
+
+	-- Combined wait_n into the t80s core: AND of MMU's wait request and
+	-- the SDRAM FSM's stall.
+	signal cpu_wait_n				: std_logic;
 
 	-- Front-panel latch holding the 8 bits driven onto the capture chain.
 	signal fpLatch					: std_logic_vector(7 downto 0) := (others => '0');
@@ -205,7 +254,7 @@ generic map(mode => 1, t2write => 1, iowait => 0)
 port map(
 	reset_n => reset_n_internal,
 	clk_n => cpuClock,
-	wait_n => '1',
+	wait_n => cpu_wait_n,
 	int_n => '1',
 	nmi_n => '1',
 	busrq_n => '1',
@@ -217,6 +266,46 @@ port map(
 	di => cpuDataIn,
 	do => cpuDataOut
 );
+
+-- ____________________________________________________________________________________
+-- MMU GOES HERE
+
+-- Active-high request signals for the MMU. The MMU uses synchronous,
+-- active-high request semantics; the Z-80 native signals are active-low.
+-- A separate `mmu_reset` signal is used because VHDL-93 (Quartus default)
+-- does not allow expressions in port associations.
+mmu_req_mem_in <= not n_MREQ;
+mmu_req_io_in  <= not n_IORQ;
+mmu_req_read   <= not n_RD;
+mmu_req_write  <= not n_WR;
+mmu_reset      <= not N_RESET;
+
+mmu1 : entity work.MMU
+generic map(physical_page_bits => 8)
+port map(
+	clk            => clk,
+	reset          => mmu_reset,
+	address_in     => cpuAddress,
+	address_out    => mmu_phys_addr,
+	cpu_data_in    => cpuDataOut,
+	cpu_data_out   => mmu_dataOut,
+	cpu_wait       => mmu_cpu_wait,
+	req_mem_in     => mmu_req_mem_in,
+	req_mem_out    => mmu_req_mem_out,
+	req_io_in      => mmu_req_io_in,
+	req_io_out     => mmu_req_io_out,
+	io_cs          => mmu_io_cs,
+	req_read       => mmu_req_read,
+	req_write      => mmu_req_write
+);
+
+-- Physical-memory decode. Block RAM covers the low 64 KB of physical
+-- memory (the first four 16 KB pages). Everything else is SDRAM.
+phys_in_blockram <= '1' when mmu_phys_addr(21 downto 16) = "000000" else '0';
+phys_in_sdram    <= not phys_in_blockram;
+
+-- Combined wait_n into the CPU. cpu_wait_n = '0' stalls the Z-80.
+cpu_wait_n <= (not mmu_cpu_wait) and sdram_wait_n;
 -- ____________________________________________________________________________________
 -- ROM GOES HERE	
 
@@ -230,10 +319,15 @@ port map(
 -- ____________________________________________________________________________________
 -- RAM GOES HERE
 
+-- Block RAM is now addressed by the MMU's physical output (low 16 bits).
+-- It is the backing store for physical pages 0..3 (physical 0x000000..0x00FFFF).
+-- Writes are qualified by both the memory-write strobe and the physical
+-- decode (phys_in_blockram); the ROM overlay at logical 0x0000-0x1FFF
+-- still wins on the cpuDataIn mux while n_RomActive = '0'.
 ram1: entity work.InternalRam64K
 port map
 (
-	address => cpuAddress(15 downto 0),
+	address => mmu_phys_addr(15 downto 0),
 	clock => clk,
 	data => cpuDataOut,
 	wren => not(n_memWR or n_internalRam1CS),
@@ -422,6 +516,10 @@ n_memRD <= n_RD or n_MREQ;
 -- ____________________________________________________________________________________
 -- CHIP SELECTS GO HERE
 
+-- Boot ROM still overlays logical 0x0000-0x1FFF before MMU translation.
+-- The ROM data wins on the cpuDataIn mux while n_RomActive = '0'; this is
+-- how the bootloader runs before it has had a chance to set up the MMU
+-- or copy code into RAM.
 n_basRomCS <= '0' when cpuAddress(15 downto 13) = "000" and n_RomActive = '0' else '1'; --8K at bottom of memory
 n_interface1CS <= '0' when cpuAddress(7 downto 1) = "1000000" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 2 Bytes $80-$81
 n_interface2CS <= '0' when cpuAddress(7 downto 1) = "1000001" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 2 Bytes $82-$83
@@ -429,22 +527,116 @@ n_ch376sCS <= '0' when cpuAddress(7 downto 1) = "0010000" and (n_ioWR='0' or n_i
 n_sdCardCS <= '0' when cpuAddress(7 downto 3) = "10001" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 8 Bytes $88-$8F
 n_fpLatchCS <= '0' when cpuAddress(7 downto 0) = x"47" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 1 Byte $47 (front-panel data latch)
 n_fpSubsysCS <= '0' when cpuAddress(7 downto 3) = "10100" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 8 Bytes $A0-$A7 (front-panel subsystem)
-n_internalRam1CS <= not n_basRomCS; -- Full Internal RAM - 64 K
+n_mmuCS <= '0' when cpuAddress(7 downto 4) = "1011" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 16 Bytes $B0-$BF (MMU)
+
+-- MMU.io_cs is active-high.
+mmu_io_cs <= '1' when n_mmuCS = '0' else '0';
+
+-- Block-RAM chip-select: assert whenever the MMU's physical address
+-- lands in the low 64 KB region. The ROM overlay still wins on the
+-- cpuDataIn mux for logical 0x0000-0x1FFF, but the underlying RAM
+-- is kept selected so writes into the ROM region silently update
+-- the backing RAM (matching legacy bootloader behaviour).
+n_internalRam1CS <= '0' when phys_in_blockram = '1' else '1';
 
 -- ____________________________________________________________________________________
 -- BUS ISOLATION GOES HERE
 
-    -- CPU data input mux needs to be written like this:
+    -- CPU data input mux. Order is significant:
+    --   * Per-port I/O peripherals at the top (legacy entries).
+    --   * MMU's own register file, only when the I/O cycle is NOT the
+    --     direct-access data port at +12 (offset "1100"); on +12 the MMU
+    --     promotes the cycle to a memory access and the data must come
+    --     from the physical-memory path below.
+    --   * ROM overlay at logical 0x0000-0x1FFF wins over RAM.
+    --   * Physical-memory path: block RAM for phys < 0x010000, SDRAM
+    --     otherwise.
     cpuDataIn <= interface1DataOut when (n_interface1CS = '0') else
                  interface2DataOut when (n_interface2CS = '0') else
                  ch376sDataOut when (n_ch376sCS = '0') else
                  sdCardDataOut when (n_sdCardCS = '0') else
                  fpLatchDataOut when (n_fpLatchCS = '0') else
                  fpSubsysDataOut when (n_fpSubsysCS = '0') else
+                 mmu_dataOut when (mmu_io_cs = '1' and cpuAddress(3 downto 0) /= "1100") else
                  basRomData when (n_basRomCS = '0') else
-                 internalRam1DataOut when (n_internalRam1CS = '0') else
+                 internalRam1DataOut when (phys_in_blockram = '1') else
+                 sdramReadData when (phys_in_sdram = '1') else
                  sramData when (n_externalRamCS = '0') else
                  x"FF";
+
+-- ____________________________________________________________________________________
+-- SDRAM CLIENT FSM
+--
+-- When the MMU promotes the current cycle into a physical memory access
+-- (req_mem_out = '1') and the physical address lives in SDRAM, we hand
+-- the access to sdram_z80_inst (in MultiComp.sv) and stall the Z-80 via
+-- wait_n until the controller pulses `ready`.
+--
+-- State graph:
+--   S_IDLE: idle, sdram_wait_n='1'. On an SDRAM memory access, latch
+--           the address/data/strobes and move to S_REQ.
+--   S_REQ : drive sdram_we/rd asserted, stall the CPU. When the
+--           controller pulses sdram_ready, latch sdramReadData (for
+--           reads) and move to S_DONE.
+--   S_DONE: deassert sdram_we/rd, release wait_n, hold one cycle so the
+--           Z-80 captures the read data on the next clock edge. Return
+--           to S_IDLE once the CPU drops MREQ/IORQ.
+sdram_addr <= "00000" & mmu_phys_addr;  -- zero-extend 22 -> 27 bits
+sdram_din  <= cpuDataOut;
+sdram_we   <= sdram_we_reg;
+sdram_rd   <= sdram_rd_reg;
+
+sdram_fsm: process(clk)
+begin
+	if rising_edge(clk) then
+		if N_RESET = '0' then
+			sdram_state   <= S_IDLE;
+			sdram_we_reg  <= '0';
+			sdram_rd_reg  <= '0';
+			sdram_wait_n  <= '1';
+			sdramReadData <= (others => '0');
+		else
+			case sdram_state is
+				when S_IDLE =>
+					sdram_we_reg <= '0';
+					sdram_rd_reg <= '0';
+					sdram_wait_n <= '1';
+					-- Kick off a request when MMU has promoted the
+					-- cycle to a physical memory access targeting SDRAM.
+					if mmu_req_mem_out = '1' and phys_in_sdram = '1' then
+						if mmu_req_write = '1' then
+							sdram_we_reg <= '1';
+							sdram_wait_n <= '0';
+							sdram_state  <= S_REQ;
+						elsif mmu_req_read = '1' then
+							sdram_rd_reg <= '1';
+							sdram_wait_n <= '0';
+							sdram_state  <= S_REQ;
+						end if;
+					end if;
+
+				when S_REQ =>
+					-- Hold strobes until the controller acknowledges.
+					if sdram_ready = '1' then
+						sdramReadData <= sdram_dout;
+						sdram_we_reg  <= '0';
+						sdram_rd_reg  <= '0';
+						sdram_wait_n  <= '1';
+						sdram_state   <= S_DONE;
+					end if;
+
+				when S_DONE =>
+					-- Wait for the CPU to release MREQ before accepting
+					-- a new request. This keeps the FSM from re-triggering
+					-- on the same Z-80 bus cycle.
+					if mmu_req_mem_out = '0' then
+						sdram_state <= S_IDLE;
+					end if;
+			end case;
+		end if;
+	end if;
+end process;
+
 -- ____________________________________________________________________________________
 -- SYSTEM CLOCKS GO HERE
 

@@ -223,10 +223,13 @@ wire user_cts_en  = USER_OUT[3];    // Enable CTS input
 assign ADC_BUS  = 'Z;
 //assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 
-// 128 MB SDRAM (XSDS dual-AS4C32M16SB) controller instance. For now the
-// client side is idle (we=rd=0) so the controller only performs init and
-// refresh. The Z-80 still boots from FPGA block RAM. Wiring the MMU's
-// physical bus into this instance is the next integration step.
+// 128 MB SDRAM (XSDS dual-AS4C32M16SB) controller instance. The client
+// side is now driven from the active CPU core via the muxed
+// sdram_*_mux signals above. When the Basic core is selected the
+// strobes are masked off and the controller only performs init/refresh;
+// when the CPM core is selected the on-core MMU+FSM drives this
+// interface for any physical address outside the low 64 KB block-RAM
+// region.
 //
 // Reset note: `reset` is declared further down in this module; this
 // instance refers to it forward. Verilog permits that for module ports.
@@ -247,13 +250,12 @@ sdram_z80 sdram_z80_inst
 	.SDRAM_CKE   (SDRAM_CKE),
 	.SDRAM_CLK   (SDRAM_CLK),
 
-	// Idle client: no requests yet
-	.addr  (27'd0),
-	.din   (8'd0),
-	.dout  (),
-	.we    (1'b0),
-	.rd    (1'b0),
-	.ready ()
+	.addr  (sdram_addr_mux),
+	.din   (sdram_din_mux),
+	.dout  (sdram_dout_mux),
+	.we    (sdram_we_mux),
+	.rd    (sdram_rd_mux),
+	.ready (sdram_ready_mux)
 );
 
 assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = 0;
@@ -561,6 +563,24 @@ wire [4:0] _rts;  // RTS signals from CPUs
 wire [4:0] _fpLED_serial;  // Front-panel WS2812 line per CPU
 wire       fpLED_serial;   // Selected by cpu_type, routed to USER_OUT[4]
 
+// Per-CPU SDRAM client buses. Only the CPM core currently drives them;
+// other CPU selections leave their slot undriven (the cpu_type mux
+// below picks the active slot, so undriven slots are harmless).
+wire [26:0] _sdram_addr [4:0];
+wire [7:0]  _sdram_din  [4:0];
+wire        _sdram_we   [4:0];
+wire        _sdram_rd   [4:0];
+
+// Final SDRAM client signals routed into sdram_z80_inst. Gated by
+// cpu_type == cpuZ80CPM so that selecting the Basic core (which
+// doesn't drive the buses) keeps the SDRAM idle.
+wire [26:0] sdram_addr_mux;
+wire [7:0]  sdram_din_mux;
+wire        sdram_we_mux;
+wire        sdram_rd_mux;
+wire [7:0]  sdram_dout_mux;
+wire        sdram_ready_mux;
+
 
 // Add baud rate selection logic
 reg [15:0] baud_increment;
@@ -595,6 +615,22 @@ begin
     fpLED_serial <= _fpLED_serial[cpu_type];
 end
 
+// SDRAM client mux: only the CPM core currently has SDRAM ports wired,
+// so gate strobes by cpu_type == cpuZ80CPM. Address/data/dout/ready can
+// pass through unconditionally; with we=rd=0 the controller stays idle.
+assign sdram_addr_mux  = _sdram_addr[cpu_type];
+assign sdram_din_mux   = _sdram_din [cpu_type];
+assign sdram_we_mux    = _sdram_we  [cpu_type] & (cpu_type == cpuZ80CPM);
+assign sdram_rd_mux    = _sdram_rd  [cpu_type] & (cpu_type == cpuZ80CPM);
+
+// Tie off SDRAM client slots for CPUs that don't have those ports.
+// (cpuZ80Basic and any future cores.) This keeps the array fully driven
+// so the mux doesn't propagate X's even when the strobes are masked.
+assign _sdram_addr[cpuZ80Basic] = 27'd0;
+assign _sdram_din [cpuZ80Basic] = 8'd0;
+assign _sdram_we  [cpuZ80Basic] = 1'b0;
+assign _sdram_rd  [cpuZ80Basic] = 1'b0;
+
 MicrocomputerZ80CPM MicrocomputerZ80CPM
 (
     .N_RESET(~reset & cpu_type == cpuZ80CPM),
@@ -619,7 +655,13 @@ MicrocomputerZ80CPM MicrocomputerZ80CPM
     .txd1(_txd[cpuZ80CPM]),
     .rts1(_rts[cpuZ80CPM]),
     .cts1(serial_cts),
-    .fpLED_serial(_fpLED_serial[cpuZ80CPM])
+    .fpLED_serial(_fpLED_serial[cpuZ80CPM]),
+    .sdram_addr (_sdram_addr[cpuZ80CPM]),
+    .sdram_din  (_sdram_din [cpuZ80CPM]),
+    .sdram_we   (_sdram_we  [cpuZ80CPM]),
+    .sdram_rd   (_sdram_rd  [cpuZ80CPM]),
+    .sdram_dout (sdram_dout_mux),
+    .sdram_ready(sdram_ready_mux)
 );
 
 MicrocomputerZ80Basic MicrocomputerZ80Basic

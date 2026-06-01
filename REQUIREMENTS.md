@@ -108,7 +108,7 @@ Entries should be kept in sync with the `n_*CS` decodes in the
 | `0x82`-`0x83` | 2      | CPM, Basic| bufferedUART (`n_interface2CS`). Serial console.                                                          |
 | `0x88`-`0x8F` | 8      | CPM, Basic| SD card controller (`n_sdCardCS`). Register offset via `cpuAddress(2 downto 0)`.                          |
 | `0xA0`-`0xA7` | 8      | CPM       | Front-panel subsystem control window (`n_fpSubsysCS`). See Front-panel I/O register map below.            |
-| _TBD_         | 16     | _planned_ | MMU register window (16 consecutive ports, aligned on a 16-port boundary). Base address not yet chosen.   |
+| `0xB0`-`0xBF` | 16     | CPM       | MMU register window (`n_mmuCS`). 4 frame-mapping low bytes at `+0..+3` (Z2-compatible), 4 high bytes at `+4..+7`, direct-access pointer at `+8..+11` (little-endian), direct-access data port at `+12`. |
 
 ### Front-panel subsystem register map (within the `0xA0`-`0xA7` window)
 
@@ -242,39 +242,88 @@ Initial configuration:
   now); the existing cpu_type mux selects which core's signal reaches
   the pin.
 
+### MMU + SDRAM integration into the CPM core — done
+
+The MMU has been instantiated inside `MicrocomputerZ80CPM.vhd` between
+the Z-80 and the memory subsystem, and the SDRAM controller's client
+side is now driven from that same core. Both Quartus revisions have
+been updated.
+
+Plumbing summary:
+
+- **MMU instantiation**: `mmu1 : entity work.MMU` with
+  `physical_page_bits => 8` (22-bit / 4 MB physical address space,
+  Z2-compatible). Reset is `not N_RESET` (MMU is active-high).
+- **I/O window**: 16 ports at **`0xB0..0xBF`** (`n_mmuCS`). Inverted
+  to active-high `mmu_io_cs` for the MMU's `io_cs` input.
+- **CPU bus**: active-low Z-80 strobes are inverted into the MMU's
+  active-high `req_mem_in / req_io_in / req_read / req_write`.
+- **Block RAM rewiring**: `InternalRam64K` is now addressed by
+  `mmu_phys_addr(15 downto 0)` (physical) instead of `cpuAddress`
+  (logical). Its chip select fires when `phys_in_blockram = '1'`
+  (i.e. `phys_addr(21:16) = "000000"`), regardless of the boot-ROM
+  overlay; writes through the ROM-overlay region still silently
+  update the underlying block RAM.
+- **Boot ROM overlay**: unchanged — `Z80_CPM_BASIC_ROM` continues to
+  win on the `cpuDataIn` mux at logical `0x0000..0x1FFF` while
+  `n_RomActive = '0'`, ahead of the physical-memory sources. The MMU
+  is invisible until the ROM unmaps itself.
+- **MMU read-back**: `mmu_dataOut` is selected on the `cpuDataIn` mux
+  when `mmu_io_cs = '1'` **except** for port `+12` (the direct-access
+  data port), where the cycle has been promoted to a physical memory
+  access and the data must come from the block RAM / SDRAM path.
+- **SDRAM client FSM**: a three-state machine (`S_IDLE`, `S_REQ`,
+  `S_DONE`) in `MicrocomputerZ80CPM.vhd` issues `we`/`rd` to the
+  SDRAM wrapper when the MMU's `req_mem_out = '1'` and
+  `phys_in_sdram = '1'`. The Z-80 is stalled via `wait_n` from
+  `S_REQ` until the controller pulses `ready`; `sdram_dout` is
+  latched into `sdramReadData` for the `cpuDataIn` mux. The FSM
+  returns to `S_IDLE` after the CPU releases `MREQ`.
+- **`wait_n` to the t80s core**: `cpu_wait_n = (not mmu_cpu_wait) and
+  sdram_wait_n`. The MMU asserts its one-cycle wait pulse on
+  direct-access cycles to give synchronous memory a beat to respond;
+  the FSM holds it for as many beats as the SDRAM controller needs.
+- **Top-level wiring** (`MultiComp.sv`): six new ports on the CPM
+  core (`sdram_addr`, `sdram_din`, `sdram_we`, `sdram_rd`,
+  `sdram_dout`, `sdram_ready`) are fed through per-CPU arrays
+  mirroring the `_fpLED_serial` pattern. The mux on `cpu_type` picks
+  the active set; `we`/`rd` are additionally masked by
+  `(cpu_type == cpuZ80CPM)` so selecting the Basic core leaves the
+  SDRAM idle. The previously idle `sdram_z80_inst` is now driven by
+  these muxed signals (the `27'd0` / `1'b0` tie-offs are gone).
+
+Reset map (unchanged from the MMU's placeholder): frames 0..3 map
+identically to physical pages 0..3. With block RAM covering physical
+0x000000..0x00FFFF, this means the Z-80's first 64 KB of logical
+address space sees the same block RAM it did before — boot and CP/M
+behaviour are preserved. Remapping frame 3 to physical page 4 (or
+higher) is the canonical way to reach into SDRAM.
+
 ### Outstanding work toward the requirements above
 
 1. **Hardware bring-up of the SDRAM controller**: compile in Quartus,
    load the bitstream, verify the SDRAM is being initialized and
    refreshed (the controller's `chip` toggling should be observable, and
-   the parts should not enter their power-down/decay regime). No
-   functional test of read/write yet — that needs a client.
+   the parts should not enter their power-down/decay regime). With the
+   MMU now wired in, a CPM program that remaps a frame to physical
+   page >= 4 can read/write SDRAM and verify the data path end-to-end.
 2. **Hardware bring-up of the front panel**: compile and load,
    confirm the WS2812 string lights up with the default identity map
    when software writes patterns to port 0x47, exercise the colour
    stream at port 0xA3 (six bytes per LED, on-G/R/B then off-G/R/B),
    confirm the brightness scaler at port 0xA0 dims/brightens, and
    confirm the framebuffer mode at port 0xA4 + 0xA6.
-3. **Wire the MMU into the system** (Requirement: "Implement MMU"). The
-   MMU is not currently instantiated. Once it is wired in:
-   - Add `set_global_assignment -name VHDL_FILE Components/alancox/MMU.vhd`
-     to **both** `MultiComp.qsf` and `MultiComp-lite.qsf` (per `AGENTS.md`).
-   - Choose the base address for the 16-port I/O window (must be aligned
-     on a 16-port boundary so the low 4 address bits are a clean
-     in-window offset).
-   - Decide whether `access_violated` needs to be re-introduced.
-4. **Connect the MMU to the layered memory** (Requirement: "Implement
-   SDRAM"). The MMU's physical address output picks between the existing
-   64 KB block RAM (when `address_out[26:16] == 0`) and the SDRAM
-   wrapper's `addr/we/rd/din/dout/ready` (otherwise). This is the step
-   that actually exercises SDRAM access.
-5. **Revisit the MMU reset map** once the layered memory is wired so the
-   identity map points at sensible regions (frame 0 at block RAM for
-   ROM/boot, etc.).
-6. **Expand the front-panel capture chain**: once the basic 8-bit
+3. **Widen `physical_page_bits`** from 8 to 13 once SDRAM access is
+   proven, to expose the full 128 MB of physical address space (the
+   SDRAM controller already supports 27-bit addresses; the CPM core
+   currently zero-extends the MMU's 22 bits to the controller's 27).
+4. **Revisit the MMU reset map** once experience with SDRAM access
+   suggests a better default than identity (e.g. frame 3 pointing
+   into SDRAM as a default "high memory window").
+5. **Expand the front-panel capture chain**: once the basic 8-bit
    chain proves out, add a wider `Transparent_Capture_Chain` (or a
    `Universal_Capture_Chain` with `STRETCH_MASK` set on a few control
    bits) sourced from CPU/MMU/SDRAM control signals to drive a real
    blinkenlights display.
-7. **Optional**: move the SDRAM to a dedicated higher-frequency clock
+6. **Optional**: move the SDRAM to a dedicated higher-frequency clock
    (e.g. 100 MHz from a regenerated PLL) once basic operation is proven.
