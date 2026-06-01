@@ -299,6 +299,62 @@ address space sees the same block RAM it did before — boot and CP/M
 behaviour are preserved. Remapping frame 3 to physical page 4 (or
 higher) is the canonical way to reach into SDRAM.
 
+### Known issues (acknowledged, not blocking)
+
+#### Pre-existing setup-timing violation in `SBCTextDisplayRGB`
+
+After the MMU/SDRAM integration, Quartus reports a setup violation on
+the system PLL output (`clk_sys`, 50 MHz):
+
+- **Worst-case setup slack**: -2.359 ns
+- **TNS (Total Negative Slack)**: -264.109 ns across ~20 paths
+- **Failing clock**: `emu|pll|pll_inst|...|PLL_OUTPUT_COUNTER|divclk`
+- **Fmax achieved**: 40.46 MHz (against 50 MHz constraint)
+
+All failing paths are inside the legacy `SBCTextDisplayRGB` text-mode
+video controller. Specifically:
+
+- **From**: `SBCTextDisplayRGB:io1|startAddr[5..6]` — the scroll-offset
+  register, updated in a `falling_edge(clk)` process (`Components/TERMINAL/SBCTextDisplayRGB.vhd:410`).
+- **To**: `DisplayRam2K:\GEN_2KATTRAM:dispAttRam|...|porta_address_reg0`
+  — the attribute RAM's port-A address input, clocked on the rising
+  edge of `clk`.
+- **Launch-to-latch budget**: 10 ns (half a 20 ns period, because the
+  launch is on the falling edge and the latch is on the rising edge).
+- **Combinational delay**: 12.138 ns through ~30 logic levels.
+
+The combinational chain is dominated by `Mod0|auto_generated|divider`
+— a synthesized restoring divider implementing the `mod
+CHARS_PER_SCREEN` operation in this concurrent assignment at
+`SBCTextDisplayRGB.vhd:401`:
+
+```vhdl
+dispAddr <= (startAddr + charHoriz + (charVert * HORIZ_CHARS)) mod CHARS_PER_SCREEN;
+```
+
+**This violation pre-dates the MMU work.** None of the failing-path
+nodes touch the MMU, SDRAM client FSM, block RAM rewiring, or any
+other recent additions; the path is wholly inside legacy code that
+has been in the build since the initial commit. The pre-MMU baseline
+(`f4d6ab2`) almost certainly fails timing in exactly the same way.
+
+The bitstream still builds, loads, and the legacy core has been
+working on real DE10-Nano silicon, which suggests the actual silicon
+delay at the operating temperature is comfortably below the slow-1100mV-100C
+timing-model worst case used for sign-off.
+
+**Decision: ignore for now.** Possible future fixes if it ever causes
+real-world misbehaviour:
+
+1. Register `dispAddr` (or its inputs) in a synchronous process so
+   the `mod` operation has a full clock period to settle.
+2. Replace `mod CHARS_PER_SCREEN` with conditional subtraction
+   (cheap since the sum naturally wraps near `CHARS_PER_SCREEN`).
+3. Add a `set_multicycle_path` constraint covering this specific
+   register-to-RAM path. Cannot be added to `sys/sys_top.sdc` (that
+   file is externally maintained); would need a project-level SDC
+   referenced from both `.qsf` files.
+
 ### Outstanding work toward the requirements above
 
 1. **Hardware bring-up of the SDRAM controller**: compile in Quartus,
