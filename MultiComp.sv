@@ -223,24 +223,101 @@ wire user_cts_en  = USER_OUT[3];    // Enable CTS input
 assign ADC_BUS  = 'Z;
 //assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 
+// ===========================================================================
 // 128 MB SDRAM (XSDS dual-AS4C32M16SB) controller instance.
 //
-// Uses the new sdram_simple controller (Components/SDRAM/sdram_simple.sv)
-// which presents an 8-bit byte-addressed interface with explicit req +
-// we_in signals (rather than separate we/rd strobes). The upstream FSM
-// in MicrocomputerZ80CPM.vhd still drives separate we/rd, so we
-// translate here: req = we | rd, we_in = we.
+// Uses the CoCo3 core's sdram_32r8w controller (Components/SDRAM/sdram2.sv),
+// which is written for exactly this dual-AS4C32M16SB board and correctly
+// handles byte-write masking (the bug that defeated the earlier
+// sdram_simple / N64-derived controllers). It runs at ~112 MHz (clk_ram),
+// whereas the Z-80 CPM core's SDRAM client FSM runs at 50 MHz (clk_sys),
+// so an explicit clock-domain crossing is performed below.
 //
-// Reset note: `reset` is declared further down in this module; this
-// instance refers to it forward. Verilog permits that for module ports.
-wire        sdram_init_done;
-wire        sdram_req   = sdram_we_mux | sdram_rd_mux;
-wire        sdram_we_in = sdram_we_mux;
+// Upstream (50 MHz, clk_sys) interface from the CPM core:
+//   sdram_addr_mux[26:0]  byte address (we only use [25:0] -> 64 MB/chip;
+//                         the controller takes a 25-bit word-ish address
+//                         with A0 = byte select)
+//   sdram_din_mux[7:0]    write data
+//   sdram_we_mux          write strobe (held until ready)
+//   sdram_rd_mux          read strobe  (held until ready)
+//   sdram_dout_mux[7:0]   read data back to CPM core
+//   sdram_ready_mux       1-cycle (clk_sys) completion pulse to CPM core
+//
+// CDC scheme: the CPM FSM asserts we/rd and holds it stable until it sees
+// ready. We synchronize that level into clk_ram, edge-detect it to make a
+// single sdram_cpu_req to the controller, wait for the controller's
+// sdram_cpu_ready, capture+byte-select the 16-bit dout, then pulse a
+// completion flag that is synchronized back into clk_sys as
+// sdram_ready_mux. Because the request level is held stable across the
+// whole transaction, simple 2-FF synchronizers are sufficient.
+// ===========================================================================
 
-sdram_simple sdram_inst
+// ---- clk_ram (112 MHz) domain signals ----
+wire        sdram_busy;
+wire        sdram_cpu_ack;
+wire        sdram_cpu_ready;     // controller: dout valid / accepted
+wire [15:0] sdram_dout16;        // controller 16-bit read data
+
+// Request level from the 50 MHz domain, synchronized into clk_ram.
+reg  [1:0]  req_sync = 2'b00;    // 2-FF synchronizer for (we|rd)
+reg         req_seen = 1'b0;     // edge-detect: previous synced request
+wire        cpu_req_level = sdram_we_mux | sdram_rd_mux;
+
+reg         ram_req  = 1'b0;     // level to controller (sdram_cpu_req)
+reg         ram_rnw  = 1'b1;     // 1=read, 0=write  (sdram_cpu_rnw)
+reg  [7:0]  ram_byte = 8'h00;    // captured read byte
+reg         ram_done = 1'b0;     // completion level toggled in clk_ram
+
+// Latch the address/data/direction at request time so they are stable for
+// the controller. These come from the 50 MHz domain but are guaranteed
+// stable for the whole held-request window, so they need no synchronizer.
+// The controller takes a 25-bit address where bit 0 selects the byte
+// within the 16-bit word and bits [24:1] are the SDRAM word address; we
+// therefore pass the byte address truncated to 25 bits straight through.
+reg  [24:0] ram_addr = 25'd0;
+reg  [7:0]  ram_din  = 8'h00;
+
+always @(posedge clk_ram) begin
+	req_sync <= {req_sync[0], cpu_req_level};
+	req_seen <= req_sync[1];
+
+	// Rising edge of the held request -> latch the transaction and raise
+	// ram_req. Hold ram_req until the controller acks (it may be busy with
+	// refresh when the request arrives), then drop it. The controller's
+	// STATE_IDLE only accepts a request while (req & !ack), and clears ack
+	// when req falls, so this level handshake is correct.
+	if (req_sync[1] & ~req_seen) begin
+		ram_req  <= 1'b1;
+		ram_rnw  <= ~sdram_we_mux;            // read when not a write
+		ram_addr <= sdram_addr_mux[24:0];     // byte address, A0 = byte select
+		ram_din  <= sdram_din_mux;
+	end else if (sdram_cpu_ack) begin
+		ram_req  <= 1'b0;                     // controller accepted it
+	end
+
+	// Controller signalled completion: capture the selected byte and flag
+	// the 50 MHz side. addr bit 0 selects high/low byte of the 16-bit word.
+	if (sdram_cpu_ready) begin
+		ram_byte <= ram_addr[0] ? sdram_dout16[15:8] : sdram_dout16[7:0];
+		ram_done <= ~ram_done;                // toggle completion level
+	end
+end
+
+// ---- back into clk_sys (50 MHz) ----
+reg  [1:0]  done_sync = 2'b00;
+reg         done_seen = 1'b0;
+always @(posedge clk_sys) begin
+	done_sync <= {done_sync[0], ram_done};
+	done_seen <= done_sync[1];
+end
+// One clk_sys pulse when the completion level toggled.
+assign sdram_ready_mux = (done_sync[1] ^ done_seen);
+assign sdram_dout_mux  = ram_byte;
+
+sdram_32r8w sdram_inst
 (
-	.clk         (clk_sys),
-	.reset       (reset),
+	.init        (reset),
+	.clk         (clk_ram),
 
 	.SDRAM_DQ    (SDRAM_DQ),
 	.SDRAM_A     (SDRAM_A),
@@ -254,14 +331,24 @@ sdram_simple sdram_inst
 	.SDRAM_CKE   (SDRAM_CKE),
 	.SDRAM_CLK   (SDRAM_CLK),
 
-	.addr      (sdram_addr_mux),
-	.din       (sdram_din_mux),
-	.dout      (sdram_dout_mux),
-	.we_in     (sdram_we_in),
-	.req       (sdram_req),
-	.ready     (sdram_ready_mux),
-	.init_done (sdram_init_done)
+	.sdram_cpu_addr  (ram_addr),
+	.sdram_dout      (sdram_dout16),
+	.sdram_cpu_din   (ram_din),
+	.sdram_cpu_req   (ram_req),
+	.sdram_cpu_rnw   (ram_rnw),
+	.sdram_cpu_ack   (sdram_cpu_ack),
+	.sdram_cpu_ready (sdram_cpu_ready),
+
+	// Video read port unused.
+	.sdram_vid_addr  (25'd0),
+	.sdram_vid_req   (1'b0),
+	.sdram_vid_ack   (),
+	.sdram_vid_ready (),
+
+	.sdram_busy      (sdram_busy)
 );
+
+wire sdram_init_done = ~sdram_busy;
 
 assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = 0;
 
@@ -356,12 +443,17 @@ hps_io #(
 
 ///////////////////////   CLOCKS   ///////////////////////////////
 wire clk_sys, locked;
+// clk_ram: ~112 MHz clock for the CoCo3 SDRAM controller (sdram_32r8w).
+// REQUIRES the PLL to be regenerated in MegaWizard to expose outclk_1.
+// See REQUIREMENTS.md "SDRAM controller: CoCo3 sdram_32r8w port".
+wire clk_ram;
 
 pll pll
 (
 	.refclk(CLK_50M),
 	.rst(0),
 	.outclk_0(clk_sys),
+	.outclk_1(clk_ram),
 	.locked(locked)
 );
 

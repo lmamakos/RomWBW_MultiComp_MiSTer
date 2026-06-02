@@ -356,9 +356,12 @@ set_global_assignment -name PRE_FLOW_SCRIPT_FILE "quartus_sh:sys/build_id.tcl"
 set_global_assignment -name CDF_FILE jtag.cdf
 set_global_assignment -name QIP_FILE sys/sys.qip
 set_global_assignment -name SYSTEMVERILOG_FILE MultiComp.sv
-set_global_assignment -name SYSTEMVERILOG_FILE Components/SDRAM/sdram_simple.sv
-# Old N64-derived controller and its wrapper are retained in the tree
-# but no longer compiled in; sdram_simple replaces both.
+# Active SDRAM controller: CoCo3 sdram_32r8w (Components/SDRAM/sdram2.sv).
+# Written for this dual-AS4C32M16SB 128 MB board; correctly masks byte
+# writes. Runs at ~112 MHz (clk_ram) with a CDC adapter in MultiComp.sv.
+set_global_assignment -name SYSTEMVERILOG_FILE Components/SDRAM/sdram2.sv
+# Earlier controllers retained in the tree but no longer compiled in:
+# set_global_assignment -name SYSTEMVERILOG_FILE Components/SDRAM/sdram_simple.sv
 # set_global_assignment -name SYSTEMVERILOG_FILE Components/SDRAM/sdram.sv
 # set_global_assignment -name SYSTEMVERILOG_FILE Components/SDRAM/sdram_z80.sv
 set_global_assignment -name VHDL_FILE Components/FRONTPANEL/FP_RAM_Store.vhd

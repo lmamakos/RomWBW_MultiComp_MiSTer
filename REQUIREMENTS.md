@@ -292,6 +292,89 @@ CPM core's FSM was required.
 solid on once `init_done` is asserted; otherwise reflects the
 legacy `vsd_sel & sd_act` (virtual SD activity).
 
+### SDRAM controller: ported CoCo3 `sdram_32r8w` (`Components/SDRAM/sdram2.sv`)
+
+`sdram_simple.sv` worked for reads and aligned-byte writes but its
+**byte-write masking (DQM) did not take effect in hardware**. The
+disambiguation test wrote distinct values to the low byte (C000) and
+high byte (C001) of the *same* 16-bit word:
+
+```basic
+20 POKE &HC000,&H11 : POKE &HC001,&H22
+30 POKE &HC002,&H33 : POKE &HC003,&H44
+```
+
+and read back `34, 34, 68, 68` (deterministically) instead of
+`17, 34, 51, 68`. That is: the high-byte write clobbered the whole
+word — the DQML mask never protected the low byte. Re-analysis showed
+the DQM/DQ/CMD were scheduled in the same FSM state (so they *should*
+align), but the mask still did not engage in hardware. Rather than
+keep chasing a half-cycle DQM timing issue, we abandoned `sdram_simple`.
+
+We ported the SDRAM controller from the MiSTer **CoCo3** core
+(`MiSTer-devel/CoCo3_MiSTer rtl/sdram/sdram2.sv`, module `sdram_32r8w`,
+© Sorgelig / Stan Hodge), imported verbatim as
+`Components/SDRAM/sdram2.sv`. It is written for **exactly** our board
+(`Alliance AS4C32M16SB-7TIN (x2)`, 128 MB) and fixes byte writes with
+a different, robust technique:
+
+```verilog
+assign {SDRAM_DQMH,SDRAM_DQML} = SDRAM_A[12:11]; // A12/A11 unused -> free for DQM
+...
+// fix byte writes [no new command until data is actually written]
+if (~sdram_cpu_rnw)
+  {cas_addr[12:9],SDRAM_BA,SDRAM_A,cas_addr[8:0]} <=
+    {~sdram_cpu_addr[0], sdram_cpu_addr[0], 2'b10, sdram_cpu_addr[24:1]};
+```
+
+The DQM lanes are driven from the upper address-register bits, loaded
+in the same register write as the column address. This guarantees the
+mask is cycle-aligned with CAS. For `addr[0]=0` (even/low byte):
+`{DQMH,DQML} = {1,0}` (write low, mask high); for `addr[0]=1`:
+`{0,1}` (write high, mask low).
+
+**Clock.** This controller runs at ~112 MHz (CAS_LATENCY=3, startup
+timing assumes ~100 MHz), while the Z-80 CPM core's SDRAM client FSM
+runs at 50 MHz (`clk_sys`). The controller derives the inverted
+SDRAM chip clock internally via its own `altddio_out`, so only **one**
+extra ~112 MHz clock (`clk_ram`) is needed.
+
+> **PLL REGENERATION REQUIRED.** The current PLL (`rtl/pll.qip` →
+> `rtl/pll/pll_0002.v`) only generates `outclk_0 = 50 MHz`. It must be
+> regenerated in MegaWizard to also expose `outclk_1 ≈ 112 MHz`.
+> `MultiComp.sv` already references `pll`'s `.outclk_1(clk_ram)`. The
+> saved PLL config (in `rtl/pll.v` retrieval-info) already describes a
+> 112 MHz tap, so the multiply/divide is known-good. Per AGENTS.md,
+> PLLs are generated IP and must be regenerated via MegaWizard rather
+> than hand-edited. `derive_pll_clocks` in `sys/sys_top.sdc` will pick
+> up the new clock automatically, and the existing clock-group
+> constraint already covers `*|pll|pll_inst|...|divclk`.
+
+**Clock-domain crossing (in `MultiComp.sv`).** The CPM FSM asserts
+`we`/`rd` and holds it stable until it sees `ready`. The adapter:
+1. 2-FF-synchronizes the held request level (`we|rd`) into `clk_ram`.
+2. On its rising edge, latches addr/din/direction and raises `ram_req`
+   to the controller; holds `ram_req` until `sdram_cpu_ack`, then drops
+   it (the controller's STATE_IDLE accepts only while `req & !ack`).
+3. On `sdram_cpu_ready`, byte-selects `sdram_dout16` by `addr[0]` into
+   `ram_byte` and toggles a `ram_done` completion level.
+4. 2-FF-synchronizes `ram_done` back into `clk_sys` and edge-detects it
+   to produce the single-cycle `sdram_ready_mux` pulse the CPM FSM
+   expects. `sdram_dout_mux = ram_byte`.
+Because the request level is held stable for the whole transaction,
+simple 2-FF synchronizers are sufficient; the read data is stable
+before the completion flag crosses domains.
+
+**Address mapping.** The controller takes a 25-bit address with
+`[0]` = byte-within-word and `[24:1]` = SDRAM word address. We pass the
+CPM core's byte address truncated to 25 bits straight through
+(`sdram_addr_mux[24:0]`), i.e. 32 MB addressable until the wider
+mapping is wired. The video read port (`sdram_vid_*`) is tied off.
+
+`LED_USER` now follows `~sdram_busy` (lit when the controller is idle /
+init complete). `sdram_simple.sv`, `sdram.sv`, and `sdram_z80.sv` remain
+in the tree but are commented out of both `.qsf` files.
+
 ### MMU + SDRAM integration into the CPM core — done
 
 The MMU has been instantiated inside `MicrocomputerZ80CPM.vhd` between
