@@ -296,8 +296,11 @@ set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to BTN_*
 set_global_assignment -name ENABLE_SIGNALTAP ON
 set_global_assignment -name USE_SIGNALTAP_FILE "output_files/status13-stp1.stp"
 set_global_assignment -name SYSTEMVERILOG_FILE Components/SDCARD/image_card.sv
-set_global_assignment -name SYSTEMVERILOG_FILE Components/SDRAM/sdram.sv
-set_global_assignment -name SYSTEMVERILOG_FILE Components/SDRAM/sdram_z80.sv
+set_global_assignment -name SYSTEMVERILOG_FILE Components/SDRAM/sdram_simple.sv
+# Old N64-derived controller and its wrapper are retained in the tree
+# but no longer compiled in; sdram_simple replaces both.
+# set_global_assignment -name SYSTEMVERILOG_FILE Components/SDRAM/sdram.sv
+# set_global_assignment -name SYSTEMVERILOG_FILE Components/SDRAM/sdram_z80.sv
 set_global_assignment -name VHDL_FILE Components/FRONTPANEL/FP_RAM_Store.vhd
 set_global_assignment -name VHDL_FILE Components/FRONTPANEL/Transparent_Capture_Chain.vhd
 set_global_assignment -name VHDL_FILE Components/FRONTPANEL/Universal_Capture_Chain.vhd

@@ -242,6 +242,56 @@ Initial configuration:
   now); the existing cpu_type mux selects which core's signal reaches
   the pin.
 
+### SDRAM controller replaced with `sdram_simple.sv`
+
+The N64-derived `Components/SDRAM/sdram.sv` controller and its
+`sdram_z80.sv` wrapper proved problematic for our use case. After
+extensive debugging via BASIC test programs we observed:
+
+- Writes consistently landed at the correct SDRAM cells.
+- Reads consistently returned data from the "next" column instead of
+  the addressed one (CMD_READ to col 0 returned col 1 data, etc.).
+- A diagnostic 4-byte mux verified that both halves of `ch1_dout`
+  ended up loaded with the same 16-bit value (the "other" column).
+- Extending the controller's `data_ready_delay` shift register by
+  one or two cycles had **zero effect** on what was captured,
+  suggesting the bug was not the originally-suspected pipeline
+  off-by-one.
+
+Rather than continue with cycle-accurate observability (SignalTap)
+on a third-party multi-channel controller, we rewrote the SDRAM
+interface as a minimal, single-port, BURST_LENGTH=1 controller:
+`Components/SDRAM/sdram_simple.sv`. Key properties:
+
+- Single 8-bit byte-addressed port (`req` + `we_in` instead of
+  separate `we`/`rd` strobes).
+- 27-bit byte address, 128 MB capable. Address decode:
+  `addr[26]` = chip, `addr[25:13]` = row, `addr[12:11]` = bank,
+  `addr[10:1]` = column, `addr[0]` = byte-within-word.
+- CAS=2, BURST_LENGTH=1 (no burst-ordering ambiguity).
+- Explicit state machine with one state per logical step (no shift
+  registers, no hidden pipeline stages).
+- Dual-chip support via `SDRAM_nCS`: chip 0 selected with nCS=0,
+  chip 1 selected with nCS=1 (assumes board-side inversion to
+  derive the second device's CS).
+- Init sequence walks both chips through PRECHARGE-all → 2x
+  AUTO_REFRESH → LOAD_MODE.
+- Refresh issued to both chips per refresh interval (~7.6 us).
+- DDR clock output: SDRAM_CLK = ~clk via `altddio_out`
+  (`datain_h=0, datain_l=1`), so SDRAM samples on its rising edge
+  at our clk falling edge.
+- Exposes `init_done` signal to indicate readiness.
+
+The old `sdram.sv` and `sdram_z80.sv` files are retained in the
+tree for reference but commented out of both `.qsf` files. The
+upstream interface in `MultiComp.sv` adapts the CPM core's
+`we`/`rd` strobes into `req`/`we_in` semantics; no change to the
+CPM core's FSM was required.
+
+`LED_USER` on the MiSTer board now indicates SDRAM init status:
+solid on once `init_done` is asserted; otherwise reflects the
+legacy `vsd_sel & sd_act` (virtual SD activity).
+
 ### MMU + SDRAM integration into the CPM core — done
 
 The MMU has been instantiated inside `MicrocomputerZ80CPM.vhd` between

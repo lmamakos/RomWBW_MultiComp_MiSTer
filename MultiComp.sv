@@ -223,20 +223,24 @@ wire user_cts_en  = USER_OUT[3];    // Enable CTS input
 assign ADC_BUS  = 'Z;
 //assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 
-// 128 MB SDRAM (XSDS dual-AS4C32M16SB) controller instance. The client
-// side is now driven from the active CPU core via the muxed
-// sdram_*_mux signals above. When the Basic core is selected the
-// strobes are masked off and the controller only performs init/refresh;
-// when the CPM core is selected the on-core MMU+FSM drives this
-// interface for any physical address outside the low 64 KB block-RAM
-// region.
+// 128 MB SDRAM (XSDS dual-AS4C32M16SB) controller instance.
+//
+// Uses the new sdram_simple controller (Components/SDRAM/sdram_simple.sv)
+// which presents an 8-bit byte-addressed interface with explicit req +
+// we_in signals (rather than separate we/rd strobes). The upstream FSM
+// in MicrocomputerZ80CPM.vhd still drives separate we/rd, so we
+// translate here: req = we | rd, we_in = we.
 //
 // Reset note: `reset` is declared further down in this module; this
 // instance refers to it forward. Verilog permits that for module ports.
-sdram_z80 sdram_z80_inst
+wire        sdram_init_done;
+wire        sdram_req   = sdram_we_mux | sdram_rd_mux;
+wire        sdram_we_in = sdram_we_mux;
+
+sdram_simple sdram_inst
 (
-	.init        (reset),
 	.clk         (clk_sys),
+	.reset       (reset),
 
 	.SDRAM_DQ    (SDRAM_DQ),
 	.SDRAM_A     (SDRAM_A),
@@ -250,12 +254,13 @@ sdram_z80 sdram_z80_inst
 	.SDRAM_CKE   (SDRAM_CKE),
 	.SDRAM_CLK   (SDRAM_CLK),
 
-	.addr  (sdram_addr_mux),
-	.din   (sdram_din_mux),
-	.dout  (sdram_dout_mux),
-	.we    (sdram_we_mux),
-	.rd    (sdram_rd_mux),
-	.ready (sdram_ready_mux)
+	.addr      (sdram_addr_mux),
+	.din       (sdram_din_mux),
+	.dout      (sdram_dout_mux),
+	.we_in     (sdram_we_in),
+	.req       (sdram_req),
+	.ready     (sdram_ready_mux),
+	.init_done (sdram_init_done)
 );
 
 assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = 0;
@@ -263,7 +268,10 @@ assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DD
 //assign UART_RTS = UART_CTS;
 assign UART_DTR = UART_DSR;
 
-assign LED_USER  = vsd_sel & sd_act;
+// LED_USER: lit solid once SDRAM init has completed; blinks at vsd_sel
+// rate before init is done. This gives a visible "SDRAM is alive"
+// indicator on the MiSTer board's user LED.
+assign LED_USER  = sdram_init_done ? 1'b1 : (vsd_sel & sd_act);
 assign LED_DISK  = ~driveLED;
 assign LED_POWER = 0;
 assign BUTTONS = 0;
