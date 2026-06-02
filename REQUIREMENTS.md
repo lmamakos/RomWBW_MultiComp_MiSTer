@@ -340,15 +340,38 @@ SDRAM chip clock internally via its own `altddio_out`, so only **one**
 extra ~112 MHz clock (`clk_ram`) is needed.
 
 > **PLL REGENERATION REQUIRED.** The current PLL (`rtl/pll.qip` →
-> `rtl/pll/pll_0002.v`) only generates `outclk_0 = 50 MHz`. It must be
-> regenerated in MegaWizard to also expose `outclk_1 ≈ 112 MHz`.
-> `MultiComp.sv` already references `pll`'s `.outclk_1(clk_ram)`. The
-> saved PLL config (in `rtl/pll.v` retrieval-info) already describes a
-> 112 MHz tap, so the multiply/divide is known-good. Per AGENTS.md,
-> PLLs are generated IP and must be regenerated via MegaWizard rather
-> than hand-edited. `derive_pll_clocks` in `sys/sys_top.sdc` will pick
-> up the new clock automatically, and the existing clock-group
-> constraint already covers `*|pll|pll_inst|...|divclk`.
+> `rtl/pll/pll_0002.v`) only generates `outclk_0 = 50 MHz`
+> (`number_of_clocks = 1`). It must be regenerated in MegaWizard to also
+> expose `outclk_1 ≈ 112 MHz`. `MultiComp.sv` references `pll`'s
+> `.outclk_1(clk_ram_112)`. The saved PLL parameter set in `rtl/pll.qip`
+> already contains an `outclk_1 = 112 MHz` definition, so the
+> multiply/divide is known-good. Per AGENTS.md, PLLs are generated IP and
+> must be regenerated via MegaWizard rather than hand-edited.
+> `derive_pll_clocks` in `sys/sys_top.sdc` will pick up the new clock
+> automatically, and the existing clock-group constraint already covers
+> `*|pll|pll_inst|...|divclk`.
+>
+> **What MegaWizard rewrites:** only files under `rtl/pll*` — `rtl/pll.v`
+> (gains the `outclk_1` port), `rtl/pll.qip`/`.cmp`/`.ppf`/`.sip`/`.spd`,
+> and `rtl/pll/pll_0002.*`. It does **not** modify `MultiComp.qsf`,
+> `MultiComp-lite.qsf`, or `MultiComp.qpf`; the design references the PLL
+> through the single `QIP_FILE rtl/pll.qip` line, which is unchanged.
+> (Note: only `MultiComp.qsf` carries that `rtl/pll.qip` line;
+> `MultiComp-lite.qsf` has no PLL reference at all — a pre-existing gap,
+> left as-is for now.)
+>
+> **100 MHz fallback.** If 112 MHz fails timing closure on the SDRAM
+> paths, build with the `SDRAM_CLK_100` Verilog define (uncomment the
+> `` `define SDRAM_CLK_100 `` line in `MultiComp.sv`'s CLOCKS section). In
+> that configuration `clk_ram` is driven by `outclk_2 ≈ 100 MHz`, and the
+> PLL must be regenerated with **three** outputs (`outclk_0` = 50,
+> `outclk_1` = 112, `outclk_2` = 100). With the define OFF (default) only
+> two outputs (`outclk_0`, `outclk_1`) are required. The CoCo3
+> `sdram_32r8w` controller is unchanged for either frequency: its refresh
+> interval constant (890 cycles, tuned for ~114 MHz) merely refreshes
+> slightly more often than necessary at 100 MHz, which is harmless. As an
+> even simpler alternative, you may instead set `outclk_1` itself to
+> 100 MHz and leave the define OFF — no third tap needed.
 
 **Clock-domain crossing (in `MultiComp.sv`).** The CPM FSM asserts
 `we`/`rd` and holds it stable until it sees `ready`. The adapter:

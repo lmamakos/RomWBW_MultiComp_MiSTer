@@ -442,20 +442,55 @@ hps_io #(
 );
 
 ///////////////////////   CLOCKS   ///////////////////////////////
+//
+// SDRAM controller clock select.
+//   - Default (this define commented out): clk_ram = outclk_1 ~112 MHz.
+//   - Fallback (uncomment SDRAM_CLK_100): clk_ram = outclk_2 ~100 MHz, for
+//     use if 112 MHz fails timing closure on the SDRAM paths. The CoCo3
+//     sdram_32r8w controller runs correctly at either frequency (its
+//     refresh interval constant is conservative at 100 MHz).
+//
+// EITHER WAY the PLL must be regenerated in MegaWizard so that the chosen
+// output clock is actually emitted (the stock IP only emits outclk_0). The
+// PLL's saved parameter set already describes outclk_1 = 112 MHz and a
+// 100 MHz tap, so the multiply/divide is known-good. See REQUIREMENTS.md
+// "SDRAM controller: CoCo3 sdram_32r8w port".
+//
+//`define SDRAM_CLK_100
+///////////////////////////////////////////////////////////////////
 wire clk_sys, locked;
-// clk_ram: ~112 MHz clock for the CoCo3 SDRAM controller (sdram_32r8w).
-// REQUIRES the PLL to be regenerated in MegaWizard to expose outclk_1.
-// See REQUIREMENTS.md "SDRAM controller: CoCo3 sdram_32r8w port".
-wire clk_ram;
+wire clk_ram;           // SDRAM controller clock (112 MHz, or 100 MHz fallback)
+wire clk_ram_112;       // PLL outclk_1 ~112 MHz
+wire clk_ram_100;       // PLL outclk_2 ~100 MHz (fallback)
 
-pll pll
-(
-	.refclk(CLK_50M),
-	.rst(0),
-	.outclk_0(clk_sys),
-	.outclk_1(clk_ram),
-	.locked(locked)
-);
+`ifdef SDRAM_CLK_100
+	// Fallback: 100 MHz from outclk_2. Regenerate the PLL with BOTH
+	// outclk_1 (112) and outclk_2 (100), or set outclk_1 itself to 100 and
+	// leave this define off. Here we route the dedicated 100 MHz tap.
+	assign clk_ram = clk_ram_100;
+	pll pll
+	(
+		.refclk(CLK_50M),
+		.rst(0),
+		.outclk_0(clk_sys),
+		.outclk_1(clk_ram_112),
+		.outclk_2(clk_ram_100),
+		.locked(locked)
+	);
+`else
+	// Default: 112 MHz from outclk_1. Only outclk_0 + outclk_1 are needed,
+	// so the PLL can be regenerated with just two outputs.
+	assign clk_ram     = clk_ram_112;
+	assign clk_ram_100 = 1'b0;        // unused in this configuration
+	pll pll
+	(
+		.refclk(CLK_50M),
+		.rst(0),
+		.outclk_0(clk_sys),
+		.outclk_1(clk_ram_112),
+		.locked(locked)
+	);
+`endif
 
 /////////////////  RESET  /////////////////////////
 
