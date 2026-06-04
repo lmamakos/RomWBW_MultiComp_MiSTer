@@ -62,6 +62,16 @@
 -- that actually exist in the register; the rest of the byte is dropped. On
 -- read, bits past physical_page_bits-1 read as 0.
 --
+-- Z2 COMPATIBILITY OF THE LOW-BYTE WRITE
+-- --------------------------------------
+-- Writing a frame's low byte (+0..+3) clears the whole mapping register
+-- first, so the high byte (bits 15:8) is forced to 0. This means software
+-- written for the original 8-bit Z2 MMU -- which only ever writes the low
+-- byte -- always selects a page in the low 256, no matter what the high
+-- byte happened to contain beforehand. To address a page above 255, write
+-- the low byte (+0..+3) FIRST and then the high byte (+4..+7); writing the
+-- high byte does not disturb the low byte.
+--
 -- DIRECT ACCESS WINDOW
 -- --------------------
 -- The direct access window (port +12) lets code read and write physical
@@ -251,11 +261,29 @@ begin
 
                 if io_cs = '1' and req_write = '1' then
                     case io_offset is
-                        -- Z2-compatible mapping register low bytes
-                        when "0000" => mmu_frame(0)(7 downto 0) <= cpu_data_in;
-                        when "0001" => mmu_frame(1)(7 downto 0) <= cpu_data_in;
-                        when "0010" => mmu_frame(2)(7 downto 0) <= cpu_data_in;
-                        when "0011" => mmu_frame(3)(7 downto 0) <= cpu_data_in;
+                        -- Z2-compatible mapping register low bytes.
+                        --
+                        -- Writing the low byte clears the entire register
+                        -- first, so any high-order page bits (present only
+                        -- when physical_page_bits > 8) are zeroed. This
+                        -- maximises compatibility with the Z2 MMU: code that
+                        -- only knows about the 8-bit page number can write the
+                        -- low byte and always land on a page in the low 256,
+                        -- regardless of whatever was previously left in the
+                        -- high byte. To select a page above 255, write the
+                        -- high byte (+4..+7) AFTER the low byte.
+                        when "0000" =>
+                            mmu_frame(0) <= (others => '0');
+                            mmu_frame(0)(7 downto 0) <= cpu_data_in;
+                        when "0001" =>
+                            mmu_frame(1) <= (others => '0');
+                            mmu_frame(1)(7 downto 0) <= cpu_data_in;
+                        when "0010" =>
+                            mmu_frame(2) <= (others => '0');
+                            mmu_frame(2)(7 downto 0) <= cpu_data_in;
+                        when "0011" =>
+                            mmu_frame(3) <= (others => '0');
+                            mmu_frame(3)(7 downto 0) <= cpu_data_in;
 
                         -- Mapping register upper bytes (extension). Only the
                         -- bits that actually exist in the register are

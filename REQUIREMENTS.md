@@ -455,6 +455,39 @@ address space sees the same block RAM it did before — boot and CP/M
 behaviour are preserved. Remapping frame 3 to physical page 4 (or
 higher) is the canonical way to reach into SDRAM.
 
+### MMU widened to 13 bits (128 MB)
+
+With the SDRAM data path proven on hardware, the MMU was widened from
+`physical_page_bits = 8` (22-bit / 4 MB) to `physical_page_bits = 13`
+(27-bit / 128 MB), covering the full XSDS module.
+
+Changes (`MicrocomputerZ80CPM.vhd`):
+- `mmu1` generic `physical_page_bits => 13`.
+- `mmu_phys_addr` widened to `std_logic_vector(26 downto 0)` (27 bits).
+- `sdram_addr <= mmu_phys_addr;` directly — no more zero-extension; the
+  27-bit physical address now fills the controller's address port.
+- Block-RAM decode tightened to `mmu_phys_addr(26 downto 16) =
+  "00000000000"`, so high SDRAM pages cannot alias into the low-64 KB
+  block RAM.
+
+The MMU module itself needed no width edits — it is parameterised by the
+generic. 8192 pages x 16 KB = 128 MB; pages 0..3 (physical
+0x000000..0x00FFFF) remain block RAM, pages 4..8191 are SDRAM.
+
+#### Z2-compatible low-byte write (MMU.vhd)
+
+Writing a frame's low byte (ports +0..+3) now clears the entire mapping
+register first, forcing the high byte (bits 15:8) to 0. Rationale: Z2 MMU
+software only ever writes the 8-bit page number via the low-byte ports;
+without this, a stale high byte left by 128 MB-aware code could leave such
+a write pointing at an unexpected high page. Clearing on low-byte write
+guarantees a low-byte-only write always lands in the low 256 pages,
+regardless of prior state. To select a page >= 256, write the low byte
+first, then the high byte (+4..+7); the high-byte write does not disturb
+the low byte. Implemented as two sequential signal assignments in the
+register process (whole-register clear, then low-byte overwrite — the
+later slice assignment wins for bits 7:0).
+
 ### Known issues (acknowledged, not blocking)
 
 #### Pre-existing setup-timing violation in `SBCTextDisplayRGB`
@@ -526,9 +559,8 @@ real-world misbehaviour:
    confirm the brightness scaler at port 0xA0 dims/brightens, and
    confirm the framebuffer mode at port 0xA4 + 0xA6.
 3. **Widen `physical_page_bits`** from 8 to 13 once SDRAM access is
-   proven, to expose the full 128 MB of physical address space (the
-   SDRAM controller already supports 27-bit addresses; the CPM core
-   currently zero-extends the MMU's 22 bits to the controller's 27).
+   proven, to expose the full 128 MB of physical address space.
+   **DONE** — see "MMU widened to 13 bits (128 MB)" below.
 4. **Revisit the MMU reset map** once experience with SDRAM access
    suggests a better default than identity (e.g. frame 3 pointing
    into SDRAM as a default "high memory window").
@@ -539,3 +571,10 @@ real-world misbehaviour:
    blinkenlights display.
 6. **Optional**: move the SDRAM to a dedicated higher-frequency clock
    (e.g. 100 MHz from a regenerated PLL) once basic operation is proven.
+   **DONE** — the SDRAM controller runs on a dedicated `clk_ram`. 112 MHz
+   showed marginal read-data capture (occasional first-read bit flips on
+   DQ 7/3/1, data stored correctly); 100 MHz (`SDRAM_CLK_100` define) is
+   clean over 356+ soak passes and is the shipping configuration.
+7. **Clean-up legacy memory device** in `MicrocomputerZ80CPM.vhd` - 
+   remove references to externalRam (`n_externalRamCS` and varous 
+   `internalRam2` related signals.

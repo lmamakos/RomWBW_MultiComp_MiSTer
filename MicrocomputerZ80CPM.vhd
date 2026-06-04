@@ -133,11 +133,12 @@ architecture struct of MicrocomputerZ80CPM is
 	signal n_mmuCS					: std_logic :='1';   -- MMU 16-port window at 0xB0..0xBF
 
 	-- MMU plumbing. The MMU translates the Z-80's 16-bit logical address
-	-- into a 22-bit physical address (physical_page_bits = 8 default).
-	-- The same block exposes the four mapping registers, a 32-bit
-	-- direct-access pointer, and a direct-access data port, all through
-	-- an external chip-select (mmu_io_cs) tied to the 0xB0..0xBF window.
-	signal mmu_phys_addr			: std_logic_vector(21 downto 0);
+	-- into a 27-bit physical address (physical_page_bits = 13), covering
+	-- the full 128 MB of SDRAM (8192 pages x 16 KB). The same block
+	-- exposes the four mapping registers, a direct-access pointer, and a
+	-- direct-access data port, all through an external chip-select
+	-- (mmu_io_cs) tied to the 0xB0..0xBF window.
+	signal mmu_phys_addr			: std_logic_vector(26 downto 0);
 	signal mmu_dataOut				: std_logic_vector(7 downto 0);
 	signal mmu_io_cs				: std_logic;
 	signal mmu_req_mem_in			: std_logic;
@@ -281,7 +282,7 @@ mmu_req_write  <= not n_WR;
 mmu_reset      <= not N_RESET;
 
 mmu1 : entity work.MMU
-generic map(physical_page_bits => 8)
+generic map(physical_page_bits => 13)
 port map(
 	clk            => clk,
 	reset          => mmu_reset,
@@ -301,7 +302,9 @@ port map(
 
 -- Physical-memory decode. Block RAM covers the low 64 KB of physical
 -- memory (the first four 16 KB pages). Everything else is SDRAM.
-phys_in_blockram <= '1' when mmu_phys_addr(21 downto 16) = "000000" else '0';
+-- All physical bits above bit 15 must be zero to hit block RAM, so high
+-- SDRAM pages never alias into it.
+phys_in_blockram <= '1' when mmu_phys_addr(26 downto 16) = "00000000000" else '0';
 phys_in_sdram    <= not phys_in_blockram;
 
 -- Combined wait_n into the CPU. cpu_wait_n = '0' stalls the Z-80.
@@ -581,7 +584,7 @@ n_internalRam1CS <= '0' when phys_in_blockram = '1' else '1';
 --   S_DONE: deassert sdram_we/rd, release wait_n, hold one cycle so the
 --           Z-80 captures the read data on the next clock edge. Return
 --           to S_IDLE once the CPU drops MREQ/IORQ.
-sdram_addr <= "00000" & mmu_phys_addr;  -- zero-extend 22 -> 27 bits
+sdram_addr <= mmu_phys_addr;  -- 27-bit physical address spans all 128 MB
 sdram_din  <= cpuDataOut;
 sdram_we   <= sdram_we_reg;
 sdram_rd   <= sdram_rd_reg;
@@ -616,19 +619,28 @@ begin
 					end if;
 
 				when S_REQ =>
-					-- Hold strobes until the controller acknowledges.
+					-- Hold strobes (and the CPU wait) until the controller
+					-- acknowledges. When it does, latch the read data but
+					-- KEEP sdram_wait_n low for one more cycle: sdramReadData
+					-- is a registered assignment and does not present the new
+					-- value until after this clock edge. Releasing wait here
+					-- would let the Z-80 sample cpuDataIn -> sdramReadData on
+					-- the same edge, capturing the PREVIOUS transaction's
+					-- byte (observed as a stale "read-by-one" error). The
+					-- wait is released in S_DONE instead.
 					if sdram_ready = '1' then
 						sdramReadData <= sdram_dout;
 						sdram_we_reg  <= '0';
 						sdram_rd_reg  <= '0';
-						sdram_wait_n  <= '1';
 						sdram_state   <= S_DONE;
 					end if;
 
 				when S_DONE =>
-					-- Wait for the CPU to release MREQ before accepting
-					-- a new request. This keeps the FSM from re-triggering
-					-- on the same Z-80 bus cycle.
+					-- sdramReadData is now stable. Release the CPU wait so
+					-- the Z-80 captures the correct read byte, then wait for
+					-- it to drop MREQ before accepting a new request (this
+					-- keeps the FSM from re-triggering on the same bus cycle).
+					sdram_wait_n <= '1';
 					if mmu_req_mem_out = '0' then
 						sdram_state <= S_IDLE;
 					end if;
