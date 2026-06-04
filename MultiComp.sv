@@ -456,7 +456,7 @@ hps_io #(
 // 100 MHz tap, so the multiply/divide is known-good. See REQUIREMENTS.md
 // "SDRAM controller: CoCo3 sdram_32r8w port".
 //
-//`define SDRAM_CLK_100
+`define SDRAM_CLK_100
 ///////////////////////////////////////////////////////////////////
 wire clk_sys, locked;
 wire clk_ram;           // SDRAM controller clock (112 MHz, or 100 MHz fallback)
