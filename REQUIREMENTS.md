@@ -517,6 +517,57 @@ the low byte. Implemented as two sequential signal assignments in the
 register process (whole-register clear, then low-byte overwrite — the
 later slice assignment wins for bits 7:0).
 
+#### Stale-read-by-one fix (SDRAM client FSM, `MicrocomputerZ80CPM.vhd`)
+
+The first SDRAM read after any change initially returned the *previous*
+transaction's byte; the second/third reads were correct. Root cause: in
+`S_REQ` the FSM latched `sdramReadData <= sdram_dout` **and** released the
+CPU wait (`sdram_wait_n <= '1'`) on the *same* clock edge. Because
+`sdramReadData` is a registered assignment, its new value is not visible
+until after that edge, so the Z-80 sampled `cpuDataIn` (→ `sdramReadData`)
+while it still held the previous value. Fix: hold the wait through `S_REQ`
+and release it one cycle later in `S_DONE`, after `sdramReadData` is
+stable (matching the FSM's own documented intent). This also explains the
+earlier intermittent `FLAKY-READ` failures — retries "passed" because the
+second read caught up. Verified by the 3-read and A/B/C/D BASIC tests and
+a clean soak.
+
+### SDRAM controller extended to full 128 MB (dual-device shared bus)
+
+Commit `98bb963`. The XSDS expansion board carries two AS4C32M16SB devices
+on a single shared 16-bit bus; **device 1's chip-select is the inverted
+copy of device 0's**, so the single FPGA `SDRAM_nCS` pin selects between
+them. (`SDRAM2_*` in the MiSTer framework is a *separate* expansion board,
+not the second device on this module — an easy and important point to get
+wrong.) The CoCo3 `sdram_32r8w` controller, which upstream reached only
+32 MB of one device with the wrong row/bank/col split, was extended:
+
+- Address ports widened 25 → 27 bits.
+- Correct per-device decomposition (AS4C32M16SB = 4 banks × 8192 rows ×
+  1024 cols × 16 bit = 64 MB/device):
+  ```
+  addr[26]    = chip   -> SDRAM_nCS (device 0 / 1)
+  addr[25:13] = row    (13 bits)
+  addr[12:11] = bank   (2 bits)
+  addr[10:1]  = column (10 bits)
+  addr[0]     = byte within the 16-bit word (DQM select)
+  ```
+- `SDRAM_nCS` driven from a `chip` register loaded with `addr[26]` at
+  command time (was hardcoded 0).
+- **Two-pass init**: `STATE_STARTUP` runs the precharge/refresh/load-mode
+  sequence once per device (via an `init_chip` bit) before entering IDLE.
+- **Alternating refresh**: refresh toggles `chip` each interval so both
+  devices are refreshed; `cycles_per_refresh` halved to `14'd390`
+  (`(64ms/8192 @ 100MHz)/2`) so each device still meets its 7.8 µs row
+  refresh period.
+- `MultiComp.sv` CDC adapter passes the full `sdram_addr_mux[26:0]` (no
+  longer truncated to 25 bits) into a 27-bit `ram_addr` and the widened
+  `sdram_cpu_addr`.
+
+All `sdram2.sv` divergences from upstream are marked `LOCAL MOD`. The
+prior 32 MB single-device config is preserved at git tag
+`sdram-32mb-working` (`ff7a1a0`) as a rollback point.
+
 ### Known issues (acknowledged, not blocking)
 
 #### Pre-existing setup-timing violation in `SBCTextDisplayRGB`
@@ -575,12 +626,13 @@ real-world misbehaviour:
 
 ### Outstanding work toward the requirements above
 
-1. **Hardware bring-up of the SDRAM controller**: compile in Quartus,
-   load the bitstream, verify the SDRAM is being initialized and
-   refreshed (the controller's `chip` toggling should be observable, and
-   the parts should not enter their power-down/decay regime). With the
-   MMU now wired in, a CPM program that remaps a frame to physical
-   page >= 4 can read/write SDRAM and verify the data path end-to-end.
+1. **Hardware bring-up of the SDRAM controller**: **DONE.** The full
+   128 MB is verified on real DE10-Nano silicon — byte-accurate writes,
+   correct reads (after the stale-read fix), both devices initialised and
+   refreshed. Verified via BASIC POKE/PEEK soak tests: a full-range soak
+   (pages 4–2047) ran 76+ clean passes, and a 128 MB soak (pages 4–8191,
+   crossing the device boundary at page 4096) plus a device-1 retention
+   test all passed.
 2. **Hardware bring-up of the front panel**: compile and load,
    confirm the WS2812 string lights up with the default identity map
    when software writes patterns to port 0x47, exercise the colour
@@ -607,3 +659,72 @@ real-world misbehaviour:
 7. **Clean-up legacy memory device** in `MicrocomputerZ80CPM.vhd` - 
    remove references to externalRam (`n_externalRamCS` and varous 
    `internalRam2` related signals.
+
+---
+
+## Session summary / current state (end of 2026-06 SDRAM bring-up)
+
+This captures where the project stands after the SDRAM bring-up and MMU
+widening work, for whoever picks it up next.
+
+### What works (verified on hardware)
+
+- **128 MB SDRAM** fully functional: byte writes, reads, both AS4C32M16SB
+  devices initialised and refreshed. See the soak-test results above.
+- **MMU** widened to `physical_page_bits = 13` (27-bit / 128 MB physical
+  address). Pages 0–3 = on-chip block RAM, pages 4–8191 = SDRAM.
+- **Z2-compatible** low-byte mapping-register writes (clears the high
+  byte).
+- **Front-panel LED subsystem** is in the build and instantiated, but
+  **not yet bring-up-tested on hardware** (item 2 above).
+- **CP/M 2.2 / 3.0 and BASIC** run as before (block RAM boot path
+  unchanged).
+
+### Build configuration
+
+- **Single Quartus revision** `MultiComp` (the stale `MultiComp-lite`
+  revision was removed — commit `bfd0cbc`).
+- Build: `quartus_sh --flow compile MultiComp -c MultiComp` →
+  `output_files/MultiComp.rbf`.
+- **Clocks**: `clk_sys` = 50 MHz (Z-80 + CPM FSM); `clk_ram` = **100 MHz**
+  (SDRAM controller), selected by the `SDRAM_CLK_100` define in
+  `MultiComp.sv` (currently **enabled** — this is the shipping config).
+  The PLL emits outclk_0=50, outclk_1=112, outclk_2=100 MHz. 112 MHz was
+  rejected for marginal SDRAM read-capture timing.
+- The SDRAM controller runs in its own clock domain; a 2-FF-synchronizer
+  CDC adapter in `MultiComp.sv` bridges the 50 ↔ 100 MHz boundary.
+
+### Key facts / gotchas for the next session
+
+- **Dual-SDRAM topology**: one shared 16-bit bus, device 1's CS = inverted
+  device 0 CS, so `SDRAM_nCS` (single pin) selects the device.
+  `SDRAM2_*` = a *different* expansion board, NOT the second chip.
+- **`SBCTextDisplayRGB` setup-timing violation** is pre-existing and
+  ignored (see Known Issues) — not caused by any recent work.
+- `sys/` files must never be modified (externally maintained ARM
+  interface).
+- PLLs are generated IP — regenerate via MegaWizard, never hand-edit.
+  Regeneration touches only `rtl/pll*` files, not the `.qsf`/`.qpf`.
+- Rollback tag `sdram-32mb-working` (`ff7a1a0`) = last 32 MB single-device
+  config.
+
+### Git state at session end
+
+- Branch `louie`, ahead of `origin/louie` by 10 commits, **not yet
+  pushed**. Notable commits: `bfd0cbc` (remove lite), `98bb963` (128 MB
+  SDRAM), `ff7a1a0` (MMU 128 MB + Z2 + stale-read fix), `cfcc8fc`
+  (100 MHz), `2a88f1c` (PLL regen).
+- Incidental Quartus housekeeping churn (`MultiComp.qsf`, `build_id.v`)
+  remains uncommitted by design.
+
+### Suggested next steps (priority order)
+
+1. **Front-panel hardware bring-up** (outstanding item 2) — the subsystem
+   is wired but never lit on real hardware.
+2. **MMU reset map** (item 4) — decide on a sensible default beyond the
+   placeholder identity map now that SDRAM is real.
+3. **Legacy memory cleanup** (item 7) — remove dead `externalRam` /
+   `internalRam2` signals from `MicrocomputerZ80CPM.vhd`.
+4. **Begin the RomWBW port** — the original project goal. The 128 MB
+   paged-memory foundation (MMU + SDRAM) is now in place to host it.
+5. **Push** the 10 local commits to `origin/louie` when ready.
