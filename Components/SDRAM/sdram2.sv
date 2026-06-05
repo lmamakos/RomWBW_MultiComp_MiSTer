@@ -60,7 +60,7 @@ module sdram_32r8w
 	output            SDRAM_CLK,   // clock for chip
 
 //	CPU R/W port
-	input      [24:0] sdram_cpu_addr,  // 25 bit address for 8bit mode. 
+	input      [26:0] sdram_cpu_addr,  // 27-bit byte address: 128 MB (dual device). 
 //	output reg [31:0] sdram_ldout,     // data output to cpu
 	output reg [15:0] sdram_dout,      // data output to cpu [for both ports]
 	input      [7:0]  sdram_cpu_din,   // data input from cpu
@@ -70,7 +70,7 @@ module sdram_32r8w
 	output reg        sdram_cpu_ready, // dout is valid. Ready to accept new read/write.
 
 //	Video R port
-	input      [24:0] sdram_vid_addr,  // 25 bit A0=0. 
+	input      [26:0] sdram_vid_addr,  // 27-bit byte address, A0=0. 
 	input             sdram_vid_req,   // request
 	output reg		  sdram_vid_ack,   // 1 = ack
 	output reg        sdram_vid_ready, // dout is valid. Ready to accept new read/write.
@@ -79,7 +79,25 @@ module sdram_32r8w
 
 );
 
-assign SDRAM_nCS  = 0; // It would appear from the schematics that this is a toggle if you want more than 64MB ram (full 128MB)
+// LOCAL MODIFICATION (RomWBW_MultiComp_MiSTer): full 128 MB support.
+// The XSDS expansion board carries two AS4C32M16SB devices on a single
+// shared 16-bit bus; device 1's chip-select is the inverted copy of
+// device 0's, so this single SDRAM_nCS pin selects between the two
+// devices (0 -> dev0, 1 -> dev1). Upstream hardcoded SDRAM_nCS = 0,
+// reaching only one device. We drive it from a `chip` register loaded
+// with the top byte-address bit (addr[26]) at command time. Init and
+// refresh walk both devices (see STATE_STARTUP and the refresh logic).
+//
+// 27-bit byte address decomposition (per the AS4C32M16SB organisation,
+// 4 banks x 8192 rows x 1024 cols x 16 bit = 64 MB/device):
+//   addr[26]    = chip   (device 0 / 1, via SDRAM_nCS)
+//   addr[25:13] = row    (13 bits)
+//   addr[12:11] = bank   (2 bits)
+//   addr[10:1]  = column (10 bits)
+//   addr[0]     = byte within the 16-bit word (DQM select)
+reg chip = 1'b0;            // current device select (drives SDRAM_nCS)
+reg init_chip = 1'b0;      // which device the startup sequence is configuring
+assign SDRAM_nCS  = chip;
 assign SDRAM_nRAS = command[2];
 assign SDRAM_nCAS = command[1];
 assign SDRAM_nWE  = command[0];
@@ -99,7 +117,12 @@ localparam MODE                = {3'b000, NO_WRITE_BURST, OP_MODE, CAS_LATENCY, 
 localparam sdram_startup_cycles= 14'd12100;// 100us, plus a little more, @ 100MHz
 localparam startup_refresh_max = 14'b11111111111111;
 //localparam cycles_per_refresh  = 14'd780;  // (64000*100)/8192-1 Calc'd as (64ms @ 100MHz)/8192 rose
-localparam cycles_per_refresh  = 14'd890;  // (64000*100)/8192-1 Calc'd as (64ms @ 114.560MHz)/8192 rose (act 895)
+//localparam cycles_per_refresh  = 14'd890;  // (64000*100)/8192-1 Calc'd as (64ms @ 114.560MHz)/8192 rose (act 895)
+// LOCAL MOD: dual-device alternating refresh. Each refresh interval the
+// `chip` select toggles, so a given device is refreshed only every OTHER
+// interval. Halve the interval so each device still meets its 7.8us row
+// refresh period: (64ms/8192 @ 100MHz)/2 = ~390 cycles.
+localparam cycles_per_refresh  = 14'd390;  // ((64000*100)/8192)/2, dual-device @ 100MHz
 
 // SDRAM commands
 wire [2:0] CMD_NOP             = 3'b111;
@@ -184,6 +207,14 @@ always @(posedge clk) begin
 			sdram_vid_ready <= 0; //not ready
 			sdram_busy <= 1'b1;
 
+			// LOCAL MOD: two-pass init. Drive SDRAM_nCS to the device being
+			// configured (init_chip) while the sequence is still running.
+			// The precharge / refresh / load-mode sequence runs once per
+			// device. (On the final cycle the completion branch below sets
+			// chip explicitly, so only update it here while counting down.)
+			if (refresh_count != 0)
+				chip <= init_chip;
+
 			// All the commands during the startup are NOPS, except these
 			if (refresh_count == startup_refresh_max-31) begin
 				// ensure all rows are closed
@@ -205,9 +236,20 @@ always @(posedge clk) begin
 			end
 
 			if (!refresh_count) begin
-				state   <= STATE_IDLE;
-				sdram_busy <= 1'b0;
-				refresh_count <= 0;
+				// LOCAL MOD: after configuring device 0, restart the whole
+				// startup sequence for device 1. Only proceed to IDLE once
+				// both devices have been initialised.
+				if (init_chip == 1'b0) begin
+					init_chip     <= 1'b1;
+					refresh_count <= startup_refresh_max - sdram_startup_cycles;
+					state         <= STATE_STARTUP;
+				end
+				else begin
+					chip       <= 1'b0;   // leave dev0 selected as the default
+					state      <= STATE_IDLE;
+					sdram_busy <= 1'b0;
+					refresh_count <= 0;
+				end
 			end
 		end
 
@@ -222,6 +264,11 @@ always @(posedge clk) begin
 			sdram_busy <= 1'b0;
 			// mask possible refresh to reduce colliding.
 			if(refresh_count > cycles_per_refresh) begin
+				// LOCAL MOD: alternate the device each refresh so both
+				// AS4C32M16SB devices on the shared bus get refreshed. A
+				// CPU access reloads `chip` from addr[26] at command time,
+				// so this toggle only affects refresh cycles.
+				chip     <= ~chip;
 				state    <= STATE_IDLE_7;
 				command  <= CMD_AUTO_REFRESH;
 				refresh_count <= 0;
@@ -241,10 +288,28 @@ always @(posedge clk) begin
 				if(sdram_cpu_req & !sdram_cpu_ack) // request has to go away after ready=0
 				begin
 //					fix byte writes [no new command until data is actually written]
+//					LOCAL MOD: full-128MB decomposition. Each AS4C32M16SB
+//					device is 64 MB (4 banks x 8192 rows x 1024 cols x 16 bit);
+//					addr[26] picks the device (chip / SDRAM_nCS), the rest
+//					decomposes per device as:
+//					  addr[25:13]=row, addr[12:11]=bank, addr[10:1]=col(10 bit),
+//					  addr[0]=byte (DQM select).
+//					cas_addr holds the column-phase word: [12:11]=DQM,
+//					[10]=auto-precharge (A10=1), [9:0]=column. SDRAM_BA=bank and
+//					SDRAM_A=row are used at ACTIVE time.
+					chip <= sdram_cpu_addr[26];   // select device for this access
 					if (~sdram_cpu_rnw)
-						{cas_addr[12:9],SDRAM_BA,SDRAM_A,cas_addr[8:0]} <= {~sdram_cpu_addr[0], sdram_cpu_addr[0], 2'b10, sdram_cpu_addr[24:1]}; // Bytes by A0 for writes
+						{cas_addr[12:9],SDRAM_BA,SDRAM_A,cas_addr[8:0]} <=
+							{~sdram_cpu_addr[0], sdram_cpu_addr[0], 1'b1, sdram_cpu_addr[10], // DQM, A10=1, col[9]
+							 sdram_cpu_addr[12:11],   // bank
+							 sdram_cpu_addr[25:13],   // row
+							 sdram_cpu_addr[9:1]};    // col[8:0]
 					else
-						{cas_addr[12:9],SDRAM_BA,SDRAM_A,cas_addr[8:0]} <= {2'b00, 2'b10, sdram_cpu_addr[24:1]}; // No bytes for reads...
+						{cas_addr[12:9],SDRAM_BA,SDRAM_A,cas_addr[8:0]} <=
+							{2'b00, 1'b1, sdram_cpu_addr[10],          // no DQM, A10=1, col[9]
+							 sdram_cpu_addr[12:11],   // bank
+							 sdram_cpu_addr[25:13],   // row
+							 sdram_cpu_addr[9:1]};    // col[8:0]
 
 					saved_data 	<= {sdram_cpu_din, sdram_cpu_din};
 					saved_wr   	<= ~sdram_cpu_rnw;
@@ -256,7 +321,14 @@ always @(posedge clk) begin
 				begin
 					if (sdram_vid_req)
 					begin
-						{cas_addr[12:9],SDRAM_BA,SDRAM_A,cas_addr[8:0]} <= {2'b00, 2'b10, sdram_vid_addr[24:1]}; // No bytes for reads...
+						// LOCAL MOD: same full-128MB decomposition as the CPU
+						// read path above (read-only, no DQM).
+						chip <= sdram_vid_addr[26];
+						{cas_addr[12:9],SDRAM_BA,SDRAM_A,cas_addr[8:0]} <=
+							{2'b00, 1'b1, sdram_vid_addr[10],
+							 sdram_vid_addr[12:11],
+							 sdram_vid_addr[25:13],
+							 sdram_vid_addr[9:1]};
 						command    	<= CMD_ACTIVE;
 						saved_vid <= 1'b1;
 						saved_wr <= 1'b0;
@@ -317,6 +389,8 @@ always @(posedge clk) begin
 		sdram_vid_ack <= 1'b0;
 		state <= STATE_STARTUP;
 		refresh_count <= startup_refresh_max - sdram_startup_cycles;
+		init_chip <= 1'b0;   // LOCAL MOD: restart two-pass init from device 0
+		chip      <= 1'b0;
 	end
 end
 

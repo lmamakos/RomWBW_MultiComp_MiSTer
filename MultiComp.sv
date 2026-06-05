@@ -234,9 +234,9 @@ assign ADC_BUS  = 'Z;
 // so an explicit clock-domain crossing is performed below.
 //
 // Upstream (50 MHz, clk_sys) interface from the CPM core:
-//   sdram_addr_mux[26:0]  byte address (we only use [25:0] -> 64 MB/chip;
-//                         the controller takes a 25-bit word-ish address
-//                         with A0 = byte select)
+//   sdram_addr_mux[26:0]  full 27-bit byte address (128 MB). bit 26 = device
+//                         select, bits [25:1] = per-device word address,
+//                         bit 0 = byte within the 16-bit word.
 //   sdram_din_mux[7:0]    write data
 //   sdram_we_mux          write strobe (held until ready)
 //   sdram_rd_mux          read strobe  (held until ready)
@@ -271,10 +271,10 @@ reg         ram_done = 1'b0;     // completion level toggled in clk_ram
 // Latch the address/data/direction at request time so they are stable for
 // the controller. These come from the 50 MHz domain but are guaranteed
 // stable for the whole held-request window, so they need no synchronizer.
-// The controller takes a 25-bit address where bit 0 selects the byte
-// within the 16-bit word and bits [24:1] are the SDRAM word address; we
-// therefore pass the byte address truncated to 25 bits straight through.
-reg  [24:0] ram_addr = 25'd0;
+// The controller takes the full 27-bit byte address (128 MB): bit 0 selects
+// the byte within the 16-bit word, bit 26 selects the device, and bits
+// [25:1] are the per-device word address. Pass it straight through.
+reg  [26:0] ram_addr = 27'd0;
 reg  [7:0]  ram_din  = 8'h00;
 
 always @(posedge clk_ram) begin
@@ -289,7 +289,7 @@ always @(posedge clk_ram) begin
 	if (req_sync[1] & ~req_seen) begin
 		ram_req  <= 1'b1;
 		ram_rnw  <= ~sdram_we_mux;            // read when not a write
-		ram_addr <= sdram_addr_mux[24:0];     // byte address, A0 = byte select
+		ram_addr <= sdram_addr_mux[26:0];     // full 27-bit byte address (128 MB)
 		ram_din  <= sdram_din_mux;
 	end else if (sdram_cpu_ack) begin
 		ram_req  <= 1'b0;                     // controller accepted it
@@ -340,7 +340,7 @@ sdram_32r8w sdram_inst
 	.sdram_cpu_ready (sdram_cpu_ready),
 
 	// Video read port unused.
-	.sdram_vid_addr  (25'd0),
+	.sdram_vid_addr  (27'd0),
 	.sdram_vid_req   (1'b0),
 	.sdram_vid_ack   (),
 	.sdram_vid_ready (),

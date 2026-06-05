@@ -388,11 +388,43 @@ Because the request level is held stable for the whole transaction,
 simple 2-FF synchronizers are sufficient; the read data is stable
 before the completion flag crosses domains.
 
-**Address mapping.** The controller takes a 25-bit address with
-`[0]` = byte-within-word and `[24:1]` = SDRAM word address. We pass the
-CPM core's byte address truncated to 25 bits straight through
-(`sdram_addr_mux[24:0]`), i.e. 32 MB addressable until the wider
-mapping is wired. The video read port (`sdram_vid_*`) is tied off.
+**Address mapping (full 128 MB).** The controller now takes the full
+27-bit byte address and reaches the entire 128 MB module. The XSDS board
+carries two AS4C32M16SB devices on a single shared 16-bit bus; device 1's
+chip-select is the inverted copy of device 0's, so the single `SDRAM_nCS`
+pin selects between them. (Note: `SDRAM2_*` in the MiSTer framework is a
+separate physical expansion board, not the second device on this module.)
+The 27-bit byte address decomposes as:
+
+```
+addr[26]    = chip   -> SDRAM_nCS (device 0 / 1)
+addr[25:13] = row    (13 bits, 8192 rows)
+addr[12:11] = bank   (2 bits, 4 banks)
+addr[10:1]  = column (10 bits, 1024 columns)
+addr[0]     = byte within the 16-bit word (DQM select)
+```
+
+Controller changes (`Components/SDRAM/sdram2.sv`, all marked `LOCAL MOD`):
+- Address ports widened to `[26:0]`; the column/bank/row packing was
+  rewritten from upstream's 24-bit (32 MB, wrong split) to the correct
+  per-device decomposition above.
+- `SDRAM_nCS` driven from a `chip` register loaded with `addr[26]` at
+  command time (was hardcoded 0).
+- **Two-pass init**: `STATE_STARTUP` runs the precharge/refresh/load-mode
+  sequence once per device (driven by an `init_chip` bit) before entering
+  `STATE_IDLE`.
+- **Alternating refresh**: the refresh logic toggles `chip` each interval
+  so both devices are refreshed. Because each device is then refreshed
+  every *other* interval, `cycles_per_refresh` is halved to `14'd390`
+  (`(64ms/8192 @ 100MHz)/2`) to keep each device within its 7.8 us row
+  refresh period.
+
+The CDC adapter in `MultiComp.sv` passes the full `sdram_addr_mux[26:0]`
+(no truncation) into a 27-bit `ram_addr` and the controller's widened
+`sdram_cpu_addr`. The video read port (`sdram_vid_*`) is tied off.
+
+The 32 MB single-device configuration is preserved at git tag
+`sdram-32mb-working` (commit `ff7a1a0`) as a rollback point.
 
 `LED_USER` now follows `~sdram_busy` (lit when the controller is idle /
 init complete). `sdram_simple.sv`, `sdram.sv`, and `sdram_z80.sv` remain
