@@ -204,8 +204,8 @@ therefore initialized and refreshed but not yet read or written by the
 Z-80. The Z-80 still boots from the existing 64 KB FPGA block RAM as
 before.
 
-Both `MultiComp.qsf` and `MultiComp-lite.qsf` have been updated with
-`SYSTEMVERILOG_FILE` entries for the two new files. The SDRAM controller
+`MultiComp.qsf` has been updated with `SYSTEMVERILOG_FILE` entries for
+the two new files. The SDRAM controller
 runs from the existing `clk_sys` (50 MHz from `rtl/pll.v`); the
 AS4C32M16SB timing constants in the controller comfortably hold at this
 frequency, so PLL regeneration is not required for first bring-up.
@@ -213,9 +213,9 @@ frequency, so PLL regeneration is not required for first bring-up.
 ### Front-panel LED subsystem (`Components/FRONTPANEL/`) — wired into the CPM core for initial bring-up
 
 The WS2812/SK6812-based blinkenlights front panel has been added to the
-build of the Z-80 CPM core. Files are referenced from both
-`MultiComp.qsf` and `MultiComp-lite.qsf`; the subsystem and capture
-chain are instantiated in `MicrocomputerZ80CPM.vhd`.
+build of the Z-80 CPM core. Files are referenced from `MultiComp.qsf`;
+the subsystem and capture chain are instantiated in
+`MicrocomputerZ80CPM.vhd`.
 
 Initial configuration:
 
@@ -353,12 +353,9 @@ extra ~112 MHz clock (`clk_ram`) is needed.
 >
 > **What MegaWizard rewrites:** only files under `rtl/pll*` — `rtl/pll.v`
 > (gains the `outclk_1` port), `rtl/pll.qip`/`.cmp`/`.ppf`/`.sip`/`.spd`,
-> and `rtl/pll/pll_0002.*`. It does **not** modify `MultiComp.qsf`,
-> `MultiComp-lite.qsf`, or `MultiComp.qpf`; the design references the PLL
-> through the single `QIP_FILE rtl/pll.qip` line, which is unchanged.
-> (Note: only `MultiComp.qsf` carries that `rtl/pll.qip` line;
-> `MultiComp-lite.qsf` has no PLL reference at all — a pre-existing gap,
-> left as-is for now.)
+> and `rtl/pll/pll_0002.*`. It does **not** modify `MultiComp.qsf` or
+> `MultiComp.qpf`; the design references the PLL through the single
+> `QIP_FILE rtl/pll.qip` line in `MultiComp.qsf`, which is unchanged.
 >
 > **100 MHz fallback.** If 112 MHz fails timing closure on the SDRAM
 > paths, build with the `SDRAM_CLK_100` Verilog define (uncomment the

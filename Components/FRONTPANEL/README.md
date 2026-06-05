@@ -7,8 +7,8 @@
 > occupies I/O ports 0xA0..0xA7. The WS2812 serial line emerges on
 > `USER_OUT[4]` of the MiSTer USER_IO port. The two new VHDL files
 > (`FP_RAM_Store`, `Transparent_Capture_Chain`, `Universal_Capture_Chain`,
-> `FrontPanel_Subsystem`) are referenced from both `MultiComp.qsf` and
-> `MultiComp-lite.qsf`. All four files analyze cleanly under GHDL
+> `FrontPanel_Subsystem`) are referenced from `MultiComp.qsf`. All four
+> files analyze cleanly under GHDL
 > VHDL-2008. The PHY timing tracks the `SYS_CLK` generic, the I/O
 > port-decoder process has a full reset clause, `STRETCH_MASK` is
 > explicitly width-checked, and the I/O port window is decoded
