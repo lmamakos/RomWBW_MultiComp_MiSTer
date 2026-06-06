@@ -568,6 +568,41 @@ All `sdram2.sv` divergences from upstream are marked `LOCAL MOD`. The
 prior 32 MB single-device config is preserved at git tag
 `sdram-32mb-working` (`ff7a1a0`) as a rollback point.
 
+### MMU direct-access window — verified on hardware
+
+The MMU's "direct access" window (ports `0xB8..0xBC`: a 4-byte
+little-endian physical-address pointer at `+8..+11` plus a data port at
+`+12`) is now **proven on real DE10-Nano silicon**, covering the full
+128 MB address space. The feature itself was already in the build
+(committed in `ff7a1a0`); this entry records its hardware verification.
+
+Verification was done with the BASIC test program
+`testing/directaccess.bas` (a scratch test, not tracked in git), which
+exercises:
+
+1. **Single-byte R/W** — write a byte through `OUT &HBC`, reload the
+   pointer, read it back through `INP(&HBC)`.
+2. **Pointer post-increment** — write four consecutive bytes with a
+   single pointer setup (relying on the auto-increment), reload, and read
+   four bytes back. Confirms the post-increment fires on **both** reads
+   and writes (it is triggered by the `+12` access ending, independent of
+   direction).
+3. **Direct write vs windowed read** — direct-write at a page's physical
+   base, then read the same bytes through the normal frame-3 `PEEK`
+   window. Confirms both paths address the same physical cells.
+4. **Windowed write vs direct read** — the reverse cross-check (`POKE`
+   through the window, `INP` through direct access).
+5. **High address / upper device** — direct R/W at physical `0x04E20000`
+   (page 5000, > 64 MB), exercising pointer bit 26 and the second
+   AS4C32M16SB device.
+
+All subtests pass. This validates the direct-access address rewrite
+(`req_mem_out` forced high, `req_io_out` low, `address_out` driven from
+the pointer), the one-cycle `cpu_wait` pulse for synchronous memory, the
+exclusion of port `+12` from the MMU read-back mux (so data flows through
+the block-RAM/SDRAM path rather than the MMU register file), and the
+27-bit pointer reaching the upper SDRAM device.
+
 ### Known issues (acknowledged, not blocking)
 
 #### Pre-existing setup-timing violation in `SBCTextDisplayRGB`
@@ -675,6 +710,10 @@ widening work, for whoever picks it up next.
   address). Pages 0–3 = on-chip block RAM, pages 4–8191 = SDRAM.
 - **Z2-compatible** low-byte mapping-register writes (clears the high
   byte).
+- **MMU direct-access window** (ports `0xB8..0xBC`) verified on hardware:
+  pointer R/W, post-increment on both reads and writes, agreement with
+  the windowed `PEEK`/`POKE` path, and access to the upper SDRAM device
+  via the 27-bit pointer. See "MMU direct-access window" above.
 - **Front-panel LED subsystem** is in the build and instantiated, but
   **not yet bring-up-tested on hardware** (item 2 above).
 - **CP/M 2.2 / 3.0 and BASIC** run as before (block RAM boot path
@@ -710,10 +749,12 @@ widening work, for whoever picks it up next.
 
 ### Git state at session end
 
-- Branch `louie`, ahead of `origin/louie` by 10 commits, **not yet
-  pushed**. Notable commits: `bfd0cbc` (remove lite), `98bb963` (128 MB
-  SDRAM), `ff7a1a0` (MMU 128 MB + Z2 + stale-read fix), `cfcc8fc`
-  (100 MHz), `2a88f1c` (PLL regen).
+- Branch `louie`. The SDRAM/MMU bring-up commits are pushed to
+  `origin/louie` (notable: `bfd0cbc` remove lite, `98bb963` 128 MB SDRAM,
+  `ff7a1a0` MMU 128 MB + Z2 + stale-read fix, `cfcc8fc` 100 MHz, `2a88f1c`
+  PLL regen, `c531ead` SDRAM bring-up summary).
+- This direct-access verification update is committed on top and tagged
+  `mmu-direct-access-working`.
 - Incidental Quartus housekeeping churn (`MultiComp.qsf`, `build_id.v`)
   remains uncommitted by design.
 
@@ -726,5 +767,7 @@ widening work, for whoever picks it up next.
 3. **Legacy memory cleanup** (item 7) — remove dead `externalRam` /
    `internalRam2` signals from `MicrocomputerZ80CPM.vhd`.
 4. **Begin the RomWBW port** — the original project goal. The 128 MB
-   paged-memory foundation (MMU + SDRAM) is now in place to host it.
-5. **Push** the 10 local commits to `origin/louie` when ready.
+   paged-memory foundation (MMU + SDRAM, with a verified direct-access
+   window for inter-bank copies) is now in place to host it.
+5. **Push** the direct-access verification commit to `origin/louie` when
+   ready.
