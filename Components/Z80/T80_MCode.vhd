@@ -1486,7 +1486,7 @@ begin
 				|"00001000"|"00001001"|"00001010"|"00001011"|"00001100"|"00001101"|"00001110"|"00001111"
 				|"00010000"|"00010001"|"00010010"|"00010011"|"00010100"|"00010101"|"00010110"|"00010111"
 				|"00011000"|"00011001"|"00011010"|"00011011"|"00011100"|"00011101"|"00011110"|"00011111"
-				|"00100000"|"00100001"|"00100010"|"00100011"|"00100100"|"00100101"|"00100110"|"00100111"
+				|"00100000"|"00100001"|"00100010"|"00100011"|"00100100"|"00100101"|"00100110"
 				|"00101000"|"00101001"|"00101010"|"00101011"|"00101100"|"00101101"|"00101110"|"00101111"
 				|"00110000"|"00110001"|"00110010"|"00110011"|"00110100"|"00110101"|"00110110"|"00110111"
 				|"00111000"|"00111001"|"00111010"|"00111011"|"00111100"|"00111101"|"00111110"|"00111111"
@@ -1512,6 +1512,33 @@ begin
 			when "01111110"|"01111111" =>
 				-- NOP, undocumented
 				null;
+			when "00100111" =>
+				-- NEXT (FORTH inner-interpreter primitive, ED 27)
+				-- Replaces the CamelForth 'next' macro:
+				--   ex de,hl / ld e,(hl) / inc hl / ld d,(hl) / inc hl / ex de,hl / jp (hl)
+				-- DE = IP. Read the 16-bit cell W at (DE), advance DE by 2,
+				-- load W into HL (working register) and jump to W (PC := W).
+				-- The Jump path drives PC from the freshly-read bytes
+				-- (DI_Reg & TmpAddr) just like RET, avoiding a register-file
+				-- read hazard, while the cell is also committed to L and H.
+				MCycles <= "011";
+				case to_integer(unsigned(MCycle)) is
+				when 2 =>
+					-- read low byte of cell at (DE=IP) -> L and TmpAddr(7:0)
+					Set_Addr_To <= aDE;
+					IncDec_16 <= "0001";	-- DE := DE + 1
+					LDZ <= '1';
+					Read_To_Reg <= '1';
+					Set_BusA_To <= "0101";	-- L
+				when 3 =>
+					-- read high byte of cell at (DE=IP+1) -> H, and PC := W
+					Set_Addr_To <= aDE;
+					IncDec_16 <= "0001";	-- DE := DE + 1 (IP now advanced by 2)
+					Jump <= '1';		-- PC := DI_Reg & TmpAddr(7:0)
+					Read_To_Reg <= '1';
+					Set_BusA_To <= "0100";	-- H
+				when others => null;
+				end case;
 -- 8 BIT LOAD GROUP
 			when "01010111" =>
 				-- LD A,I
