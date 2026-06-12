@@ -62,10 +62,10 @@ entity MicrocomputerZ80CPM is
 		sdSCLK			: out std_logic;
 		driveLED		: out std_logic :='1';
 
-		usbCS			: out std_logic;
-		usbMOSI			: out std_logic;
-		usbMISO			: in std_logic;
-		usbSCLK			: out std_logic;
+		-- usbCS			: out std_logic;
+		-- usbMOSI			: out std_logic;
+		-- usbMISO			: in std_logic;
+		-- usbSCLK			: out std_logic;
 
 		-- Front-panel WS2812/SK6812 single-wire serial output. Initial
 		-- integration: 8 bits latched from I/O port 0x47 drive an 8-bit
@@ -97,13 +97,14 @@ architecture struct of MicrocomputerZ80CPM is
 	signal cpuAddress				: std_logic_vector(15 downto 0);
 	signal cpuDataOut				: std_logic_vector(7 downto 0);
 	signal cpuDataIn				: std_logic_vector(7 downto 0);
+	signal cpuDbgRegisters			: std_logic_vector(211 downto 0);
 
 	signal basRomData				: std_logic_vector(7 downto 0);
 	signal internalRam1DataOut		: std_logic_vector(7 downto 0);
 	signal internalRam2DataOut		: std_logic_vector(7 downto 0);
 	signal interface1DataOut		: std_logic_vector(7 downto 0);
 	signal interface2DataOut		: std_logic_vector(7 downto 0);
-	signal ch376sDataOut			: std_logic_vector(7 downto 0);
+--	signal ch376sDataOut			: std_logic_vector(7 downto 0);
 	signal sdCardDataOut			: std_logic_vector(7 downto 0);
 	signal fpLatchDataOut			: std_logic_vector(7 downto 0);
 	signal fpSubsysDataOut			: std_logic_vector(7 downto 0);
@@ -126,7 +127,7 @@ architecture struct of MicrocomputerZ80CPM is
 	signal n_basRomCS				: std_logic :='1';
 	signal n_interface1CS			: std_logic :='1';
 	signal n_interface2CS			: std_logic :='1';
-	signal n_ch376sCS				: std_logic :='1';
+--	signal n_ch376sCS				: std_logic :='1';
 	signal n_sdCardCS				: std_logic :='1';
 	signal n_fpLatchCS				: std_logic :='1';   -- I/O port 0x47 latch
 	signal n_fpSubsysCS				: std_logic :='1';   -- FrontPanel_Subsystem 8-port window at 0xA0..0xA7
@@ -195,26 +196,26 @@ architecture struct of MicrocomputerZ80CPM is
 	--CPM
 	signal n_RomActive 				: std_logic := '0';
 
-	component ch376s_module is
-		port (
-			-- interface
-			clk : 	in std_logic;
-			rd : 	in std_logic;
-			wr : 	in std_logic;
-			reset : in std_logic;
-			a0 : 	in std_logic;
+	-- component ch376s_module is
+	-- 	port (
+	-- 		-- interface
+	-- 		clk : 	in std_logic;
+	-- 		rd : 	in std_logic;
+	-- 		wr : 	in std_logic;
+	-- 		reset : in std_logic;
+	-- 		a0 : 	in std_logic;
 			
-			-- SPI wires
-			sck : 	out std_logic;
-			sdcs : 	out std_logic;
-			sdo : 	out std_logic; -- reg
-			sdi : 	in std_logic;
+	-- 		-- SPI wires
+	-- 		sck : 	out std_logic;
+	-- 		sdcs : 	out std_logic;
+	-- 		sdo : 	out std_logic; -- reg
+	-- 		sdi : 	in std_logic;
 			
-			-- data
-			din : 	in std_logic_vector (7 downto 0);
-			dout : 	out std_logic_vector (7 downto 0) -- reg
-		);
-	end component;
+	-- 		-- data
+	-- 		din : 	in std_logic_vector (7 downto 0);
+	-- 		dout : 	out std_logic_vector (7 downto 0) -- reg
+	-- 	);
+	-- end component;
 	
 	
 begin
@@ -265,7 +266,8 @@ port map(
 	wr_n => n_WR,
 	a => cpuAddress,
 	di => cpuDataIn,
-	do => cpuDataOut
+	do => cpuDataOut,
+        REG => cpuDbgRegisters
 );
 
 -- ____________________________________________________________________________________
@@ -407,23 +409,23 @@ port map(
         clk => clk
     );
 
-usb : ch376s_module
-port map (
-	sdcs	=> 	usbCS,
-	sdo 	=> 	usbMOSI,
-	sdi 	=> 	usbMISO,
-	sck 	=> 	usbSCLK,
+-- usb : ch376s_module
+-- port map (
+-- 	sdcs	=> 	usbCS,
+-- 	sdo 	=> 	usbMOSI,
+-- 	sdi 	=> 	usbMISO,
+-- 	sck 	=> 	usbSCLK,
 
-	wr 		=> 	not (n_ch376sCS or n_ioWR),
-	rd 		=> 	not (n_ch376sCS or n_ioRD),
+-- 	wr 		=> 	not (n_ch376sCS or n_ioWR),
+-- 	rd 		=> 	not (n_ch376sCS or n_ioRD),
 
-	dout 	=> 	ch376sDataOut,
-	din 	=> 	cpuDataOut,
+-- 	dout 	=> 	ch376sDataOut,
+-- 	din 	=> 	cpuDataOut,
 	
-	a0 		=> 	cpuAddress (0),
-	reset 	=> 	not (N_RESET),
-	clk 	=> 	sdClock -- twice the spi clk
-);
+-- 	a0 		=> 	cpuAddress (0),
+-- 	reset 	=> 	not (N_RESET),
+-- 	clk 	=> 	sdClock -- twice the spi clk
+-- );
 
 -- ____________________________________________________________________________________
 -- FRONT PANEL GOES HERE
@@ -523,10 +525,10 @@ n_memRD <= n_RD or n_MREQ;
 -- The ROM data wins on the cpuDataIn mux while n_RomActive = '0'; this is
 -- how the bootloader runs before it has had a chance to set up the MMU
 -- or copy code into RAM.
-n_basRomCS <= '0' when cpuAddress(15 downto 13) = "000" and n_RomActive = '0' else '1'; --8K at bottom of memory
+n_basRomCS <= '0' when cpuAddress(15 downto 13) = "000" and n_memRD='0' and n_RomActive = '0' else '1'; --8K at bottom of memory
 n_interface1CS <= '0' when cpuAddress(7 downto 1) = "1000000" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 2 Bytes $80-$81
 n_interface2CS <= '0' when cpuAddress(7 downto 1) = "1000001" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 2 Bytes $82-$83
-n_ch376sCS <= '0' when cpuAddress(7 downto 1) = "0010000" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 2 Bytes $20-$21
+-- n_ch376sCS <= '0' when cpuAddress(7 downto 1) = "0010000" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 2 Bytes $20-$21
 n_sdCardCS <= '0' when cpuAddress(7 downto 3) = "10001" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 8 Bytes $88-$8F
 n_fpLatchCS <= '0' when cpuAddress(7 downto 0) = x"47" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 1 Byte $47 (front-panel data latch)
 n_fpSubsysCS <= '0' when cpuAddress(7 downto 3) = "10100" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 8 Bytes $A0-$A7 (front-panel subsystem)
@@ -556,7 +558,7 @@ n_internalRam1CS <= '0' when phys_in_blockram = '1' else '1';
     --     otherwise.
     cpuDataIn <= interface1DataOut when (n_interface1CS = '0') else
                  interface2DataOut when (n_interface2CS = '0') else
-                 ch376sDataOut when (n_ch376sCS = '0') else
+--                 ch376sDataOut when (n_ch376sCS = '0') else
                  sdCardDataOut when (n_sdCardCS = '0') else
                  fpLatchDataOut when (n_fpLatchCS = '0') else
                  fpSubsysDataOut when (n_fpSubsysCS = '0') else
