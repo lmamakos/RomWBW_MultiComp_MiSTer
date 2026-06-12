@@ -108,7 +108,8 @@ entity T80 is
 		TS			: out std_logic_vector(2 downto 0);
 		IntCycle_n	: out std_logic;
 		IntE		: out std_logic;
-		Stop		: out std_logic
+		Stop		: out std_logic;
+		REG		: out std_logic_vector(211 downto 0) -- IFF2, IFF1, IM, IY, HL', DE', BC', IX, HL, DE, BC, PC, SP, R, I, F', A', F, A
 	);
 end T80;
 
@@ -238,8 +239,16 @@ architecture rtl of T80 is
 	signal SetEI			: std_logic;
 	signal IMode			: std_logic_vector(1 downto 0);
 	signal Halt				: std_logic;
+	signal DOR			: std_logic_vector(127 downto 0);
 
 begin
+        -- IFF2, IFF1, IM, IY, HL', DE', BC', IX, HL, DE, BC, PC, SP, R, I, F', A', F, A
+	REG <= IntE_FF2 & IntE_FF1 & IStatus &
+               DOR &
+               std_logic_vector(PC) & std_logic_vector(SP) & std_logic_vector(R) & I & Fp & Ap & F & ACC when Alternate = '0'
+	  else IntE_FF2 & IntE_FF1 & IStatus &
+               DOR(127 downto 112) & DOR(47 downto 0) & DOR(63 downto 48) & DOR(111 downto 64) &
+               std_logic_vector(PC) & std_logic_vector(SP) & std_logic_vector(R) & I & Fp & Ap & F & ACC;
 
 	mcode : T80_MCode
 		generic map(
@@ -832,7 +841,8 @@ begin
 			DOBH => RegBusB(15 downto 8),
 			DOBL => RegBusB(7 downto 0),
 			DOCH => RegBusC(15 downto 8),
-			DOCL => RegBusC(7 downto 0));
+			DOCL => RegBusC(7 downto 0),
+			DOR  => DOR);
 
 ---------------------------------------------------------------------------
 --
