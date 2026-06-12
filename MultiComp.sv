@@ -184,17 +184,21 @@ module emu
 
 // User Port - extra USB 3.1A style connector on MiSTer
 //
-// USB	P7	Name PIN	Mister	emu wire
-// 1	+5V	+5V			
-// 2	2	TX	SDA		AH9		USER_IO[1]
-// 3	1	RX	SCL		AG11	USER_IO[0]
-// 4	GND	GND			
-// 5	8	DSR	IO10	AF15	USER_IO[5]
-// 6	7	DTR	IO11	AG16	USER_IO[4]
-// 7	6	CTS	IO12	AH11	USER_IO[3]
-// 8	5	RTS	IO13	AH12	USER_IO[2]
-// 9	10	IO6	IO8		AF17	USER_IO[6]
+// USB	P7	Name PIN	Mister	emu wire     USB 3.0 signal
+// 1	+5V	+5V					VBUS  (Red)
+// 2	2	TX	SDA	AH9	USER_IO[1]	D-    (White)
+// 3	1	RX	SCL	AG11	USER_IO[0]	D+    (Green)
+// 4	GND	GND					GND   (Black)
+// 5	8	DSR	IO10	AF15	USER_IO[5]	RX-   (Blue)
+// 6	7	DTR	IO11	AG16	USER_IO[4]	RX+   (Yellow)
+// 7	6	CTS	IO12	AH11	USER_IO[3]	GND_DRAIN?
+// 8	5	RTS	IO13	AH12	USER_IO[2]	TX-   (Purple)
+// 9	10	IO6	IO8	AF17	USER_IO[6]	TX+   (Orange)
 
+//   Note: USB3 TX+/TX-/RX+/RX- from the perspective of the A connector;
+//   the B connector has the TX/RX reversed.  The pins marked on the USB3
+//   breakout board is from the perspective of the B connector signals.
+   
 // FT232 USB to serial cable
 //          sig     usb io connector
 // Red	 	5V
@@ -202,7 +206,7 @@ module emu
 // White	RXD		2
 // Green	TXD		3
 // Yellow	RTS		7
-// Blue		CTS     8
+// Blue		CTS		8
 
 // Define meaningful names for USER_IO signals
 // Input pins (USER_IN)
@@ -218,7 +222,8 @@ wire user_rx_en   = USER_OUT[0];    // Enable RX input
 wire user_tx      = USER_OUT[1];    // Serial TX to USER_IO port
 wire user_rts     = USER_OUT[2];    // RTS to USER_IO port
 wire user_cts_en  = USER_OUT[3];    // Enable CTS input
-// USER_OUT[4:6] unused
+wire user_fpLED_serial = USER_OUT[4]; // front panel LED string
+// USER_OUT[5:6] unused
 
 assign ADC_BUS  = 'Z;
 //assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
@@ -380,7 +385,7 @@ parameter CONF_STR = {
 	"S,IMG;",
 	"OF,Reset after Mount,No,Yes;", 
 	"-;",
-	"O68,CPU-ROM,Z80-CP/M,Z80-BASIC;",
+	"O68,CPU-ROM,Z80-CP/M;",
 	"-;",
 	"O9B,Baud Rate tty,115200,38400,19200,9600,4800,2400;",
 	"OC,Serial Port,Console Port,User IO Port;",
@@ -654,7 +659,7 @@ assign UART_RTS = (serial_port_select || !flow_control_enable) ? 1'b1 : serial_r
 
 // USER_IO port control - single assignment for all outputs.
 // USER_OUT[4] carries the front-panel WS2812 single-wire serial line
-// (driven only by the CPM core for now; Basic ties it to '0').
+
 assign USER_OUT = {
     2'b0,                                                              // [6:5] unused
     fpLED_serial,                                                      // [4] front-panel WS2812 data
@@ -669,12 +674,13 @@ assign user_rx_en 	= USER_OUT[0];
 assign user_tx 		= USER_OUT[1];
 assign user_rts 	= USER_OUT[2];
 assign user_cts_en 	= USER_OUT[3];
-
+assign user_fpLED_serial = USER_OUT[4];
+   
 ///////////////////////////////////////////////////
 
 assign CLK_VIDEO = clk_sys;
 
-typedef enum {cpuZ80CPM='b000, cpuZ80Basic='b001} cpu_type_enum;
+typedef enum {cpuZ80CPM='b000} cpu_type_enum;
 wire [2:0] cpu_type = status[8:6];
 
 typedef enum {baud115200='b000, baud38400='b001, baud19200='b010, baud9600='b011, baud4800='b100, baud2400='b101} baud_rate_enum;
@@ -707,8 +713,7 @@ wire        _sdram_we   [4:0];
 wire        _sdram_rd   [4:0];
 
 // Final SDRAM client signals routed into sdram_z80_inst. Gated by
-// cpu_type == cpuZ80CPM so that selecting the Basic core (which
-// doesn't drive the buses) keeps the SDRAM idle.
+// cpu_type == cpuZ80CPM 
 wire [26:0] sdram_addr_mux;
 wire [7:0]  sdram_din_mux;
 wire        sdram_we_mux;
@@ -758,13 +763,6 @@ assign sdram_din_mux   = _sdram_din [cpu_type];
 assign sdram_we_mux    = _sdram_we  [cpu_type] & (cpu_type == cpuZ80CPM);
 assign sdram_rd_mux    = _sdram_rd  [cpu_type] & (cpu_type == cpuZ80CPM);
 
-// Tie off SDRAM client slots for CPUs that don't have those ports.
-// (cpuZ80Basic and any future cores.) This keeps the array fully driven
-// so the mux doesn't propagate X's even when the strobes are masked.
-assign _sdram_addr[cpuZ80Basic] = 27'd0;
-assign _sdram_din [cpuZ80Basic] = 8'd0;
-assign _sdram_we  [cpuZ80Basic] = 1'b0;
-assign _sdram_rd  [cpuZ80Basic] = 1'b0;
 
 MicrocomputerZ80CPM MicrocomputerZ80CPM
 (
@@ -798,34 +796,6 @@ MicrocomputerZ80CPM MicrocomputerZ80CPM
     .sdram_dout (sdram_dout_mux),
     .sdram_ready(sdram_ready_mux)
 );
-
-MicrocomputerZ80Basic MicrocomputerZ80Basic
-(
-    .N_RESET(~reset & cpu_type == cpuZ80Basic),
-    .clk(cpu_type == cpuZ80Basic ? clk_sys : 0),
-    .baud_increment(baud_increment),
-    .R(_r[cpuZ80Basic][1:0]),
-    .G(_g[cpuZ80Basic][1:0]),
-    .B(_b[cpuZ80Basic][1:0]),
-    .HS(_hs[cpuZ80Basic]),
-    .VS(_vs[cpuZ80Basic]),
-    .hBlank(_hblank[cpuZ80Basic]),
-    .vBlank(_vblank[cpuZ80Basic]),
-    .cepix(_CE_PIXEL[cpuZ80Basic]),
-    .ps2Clk(PS2_CLK),
-    .ps2Data(PS2_DAT),
-	.sdCS(_SD_CS[cpuZ80Basic]),
-	.sdMOSI(_SD_MOSI[cpuZ80Basic]),
-	.sdMISO(sdmiso),
-	.sdSCLK(_SD_SCK[cpuZ80Basic]),
-    .driveLED(_driveLED[cpuZ80Basic]),
-    .rxd1(serial_rx),
-    .txd1(_txd[cpuZ80Basic]),
-    .rts1(_rts[cpuZ80Basic]),
-    .cts1(serial_cts),
-    .fpLED_serial(_fpLED_serial[cpuZ80Basic])
-);
-
 
 video_cleaner video_cleaner
 (
