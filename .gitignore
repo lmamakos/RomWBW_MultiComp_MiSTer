@@ -11,3 +11,4 @@ work-obj*.cf
 
 # AI assistant session transcripts
 session-ses_*.md
+.Xauthority
