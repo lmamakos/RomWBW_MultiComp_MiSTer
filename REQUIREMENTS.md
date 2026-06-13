@@ -69,6 +69,34 @@ into the MMU.
 We need to implement the MMU in the system design, rather than directly
 accessing memory.
 
+### Z-80 custom FORTH `NEXT` instruction
+
+To support the CamelFORTH implementation distributed with RomWBW, add a
+custom Z-80 instruction that implements the FORTH direct-threaded `NEXT`
+inner-interpreter primitive in a single opcode, replacing the 7-byte
+inline macro emitted at the end of every CamelFORTH CODE word. The goal is
+to shrink the FORTH dictionary and speed up inner-interpreter dispatch.
+
+The instruction shall use the Z-80 register conventions of CamelFORTH:
+
+- `BC` = TOS (top parameter-stack item)
+- `HL` = W (working register)
+- `DE` = IP (interpreter pointer)
+- `SP` = PSP, `IX` = RSP, `IY` = UP
+
+It shall be encoded in the `0xED` ("Misc. Instructions") prefix space at
+opcode **`ED 27`**, a previously-unused (NOP/undocumented) slot. Its
+operation shall be equivalent to the macro:
+
+```
+ex de,hl / ld e,(hl) / inc hl / ld d,(hl) / inc hl / ex de,hl / jp (hl)
+```
+
+i.e. read the 16-bit cell `W` from memory at `(IP)`, advance `IP` by 2,
+load `W` into `HL`, and jump (`PC := W`). `HL = W` is required because the
+direct-threaded runtime words (`DOLIST`/`ENTER`, `DOVAR`, `DOCON`,
+`DODOES`, `EXECUTE`) derive the parameter-field address from `W` in `HL`.
+
 ### Implement SDRAM
 
 Use the 128 Mbytes of SDRAM (XSDS dual-AS4C32M16SB module, two 64 MB
@@ -88,6 +116,45 @@ while exposing SDRAM for testing. The MMU will eventually be inserted
 between the Z-80 and this layout; until it is, the SDRAM controller runs
 idle (no client) so that init/refresh of the parts can be verified
 independently.
+
+
+### Loadable Boot ROM and RAM disk images from the MiSTer OSD
+
+We want the user to be able to specify two types of files in the MiSTer OSD
+interface.
+
+1. A binary files (with a `.BIN` extension) that will be loaded into
+SDRAM memory, starting at physical address 0x0000.  This file can be
+as long as 512KB.  This would replace the 8KB ROM image that overlays
+the bottom of the address space, and when this file is loaded, the ROM
+should be disabled and the 64KB of block RAM should also be disabled.
+When this file is loaded, it is essentially the "Boot" image that's
+started when the Z-80 CPU comes out of reset and starts executing at
+address 0x0000.
+
+2. One or more "RAM Disk" images, which would be 8MB in length and be
+accessed as a memory/RAM disk device by RomWBW.  Minimally, we should
+support one of these images, and it would be loaded (by default) in
+the top 8MB of the 128MB SDRAM address space.  It should be possible
+to easily extend this implementation to load additiona 8MB RAM disk
+images at other starting addresses.  These RAM disk images would have
+the file extension `.DSK` in their names.
+
+Having this capability means that software upgrades no long require
+regenerating an FPGA core with, e.g., updated boot monitor, etc.
+
+The anticipated uses of this "boot ROM" capability are:
+
+- load RomWBW 
+- load the existing 8KB boot ROM that's part of the FPGA core so far.
+- build alternative Boot ROMs and easily test and use them
+- boot a standalone FORTH-based monitor capability
+
+The 8MB RAM Disk file image would be used by RomWBW after it is loaded
+and started.
+
+This feature should use the MiSTer configuration string to specify the
+options to load the Boot ROM and RAM disk images.
 
 
 ## Progress
@@ -204,74 +271,8 @@ Initial configuration:
   now); the existing cpu_type mux selects which core's signal reaches
   the pin.
 
-### SDRAM controller replaced with `sdram_simple.sv`
-
-The N64-derived `Components/SDRAM/sdram.sv` controller and its
-`sdram_z80.sv` wrapper proved problematic for our use case. After
-extensive debugging via BASIC test programs we observed:
-
-- Writes consistently landed at the correct SDRAM cells.
-- Reads consistently returned data from the "next" column instead of
-  the addressed one (CMD_READ to col 0 returned col 1 data, etc.).
-- A diagnostic 4-byte mux verified that both halves of `ch1_dout`
-  ended up loaded with the same 16-bit value (the "other" column).
-- Extending the controller's `data_ready_delay` shift register by
-  one or two cycles had **zero effect** on what was captured,
-  suggesting the bug was not the originally-suspected pipeline
-  off-by-one.
-
-Rather than continue with cycle-accurate observability (SignalTap)
-on a third-party multi-channel controller, we rewrote the SDRAM
-interface as a minimal, single-port, BURST_LENGTH=1 controller:
-`Components/SDRAM/sdram_simple.sv`. Key properties:
-
-- Single 8-bit byte-addressed port (`req` + `we_in` instead of
-  separate `we`/`rd` strobes).
-- 27-bit byte address, 128 MB capable. Address decode:
-  `addr[26]` = chip, `addr[25:13]` = row, `addr[12:11]` = bank,
-  `addr[10:1]` = column, `addr[0]` = byte-within-word.
-- CAS=2, BURST_LENGTH=1 (no burst-ordering ambiguity).
-- Explicit state machine with one state per logical step (no shift
-  registers, no hidden pipeline stages).
-- Dual-chip support via `SDRAM_nCS`: chip 0 selected with nCS=0,
-  chip 1 selected with nCS=1 (assumes board-side inversion to
-  derive the second device's CS).
-- Init sequence walks both chips through PRECHARGE-all → 2x
-  AUTO_REFRESH → LOAD_MODE.
-- Refresh issued to both chips per refresh interval (~7.6 us).
-- DDR clock output: SDRAM_CLK = ~clk via `altddio_out`
-  (`datain_h=0, datain_l=1`), so SDRAM samples on its rising edge
-  at our clk falling edge.
-- Exposes `init_done` signal to indicate readiness.
-
-The old `sdram.sv` and `sdram_z80.sv` files are retained in the
-tree for reference but commented out of both `.qsf` files. The
-upstream interface in `MultiComp.sv` adapts the CPM core's
-`we`/`rd` strobes into `req`/`we_in` semantics; no change to the
-CPM core's FSM was required.
-
-`LED_USER` on the MiSTer board now indicates SDRAM init status:
-solid on once `init_done` is asserted; otherwise reflects the
-legacy `vsd_sel & sd_act` (virtual SD activity).
 
 ### SDRAM controller: ported CoCo3 `sdram_32r8w` (`Components/SDRAM/sdram2.sv`)
-
-`sdram_simple.sv` worked for reads and aligned-byte writes but its
-**byte-write masking (DQM) did not take effect in hardware**. The
-disambiguation test wrote distinct values to the low byte (C000) and
-high byte (C001) of the *same* 16-bit word:
-
-```basic
-20 POKE &HC000,&H11 : POKE &HC001,&H22
-30 POKE &HC002,&H33 : POKE &HC003,&H44
-```
-
-and read back `34, 34, 68, 68` (deterministically) instead of
-`17, 34, 51, 68`. That is: the high-byte write clobbered the whole
-word — the DQML mask never protected the low byte. Re-analysis showed
-the DQM/DQ/CMD were scheduled in the same FSM state (so they *should*
-align), but the mask still did not engage in hardware. Rather than
-keep chasing a half-cycle DQM timing issue, we abandoned `sdram_simple`.
 
 We ported the SDRAM controller from the MiSTer **CoCo3** core
 (`MiSTer-devel/CoCo3_MiSTer rtl/sdram/sdram2.sv`, module `sdram_32r8w`,
@@ -565,6 +566,281 @@ exclusion of port `+12` from the MMU read-back mux (so data flows through
 the block-RAM/SDRAM path rather than the MMU register file), and the
 27-bit pointer reaching the upper SDRAM device.
 
+### Z-80 custom FORTH `NEXT` instruction (`ED 27`) — HDL implemented, GHDL-verified, hardware test pending
+
+The CamelFORTH `NEXT` primitive has been implemented as a new Z-80
+instruction in the T80 core, entirely within
+`Components/Z80/T80_MCode.vhd` (the microcode decode table). No other
+core files (`T80.vhd`, `T80_Reg.vhd`, `T80_Pack.vhd`, `T80_ALU.vhd`,
+`T80s.vhd`) and no `.qsf` entries needed changes — the instruction is
+composed solely from existing control signals, so the core's port
+interface is unchanged.
+
+**Encoding:** `ED 27` (ED-prefix, opcode `0x27` / `00100111`), previously
+a NOP/undocumented slot. Removed `00100111` from the ED NOP list and added
+a dedicated decode arm.
+
+**Operation** (DE = IP, HL = W), equivalent to the 7-byte CamelFORTH
+`next` macro `ex de,hl / ld e,(hl) / inc hl / ld d,(hl) / inc hl /
+ex de,hl / jp (hl)`:
+
+- **MCycle 2**: address ← DE (IP); read low byte → `L` (and into
+  `TmpAddr(7:0)` via `LDZ`); `DE := DE + 1`.
+- **MCycle 3**: address ← DE (IP+1); read high byte → `H`; `DE := DE + 2`;
+  `PC := DI_Reg & TmpAddr(7:0)` via the `Jump` path.
+
+Net effect: `HL := W = mem[IP]`, `IP := IP + 2`, `PC := W`. The `Jump`
+datapath sources `PC` from the freshly-read bytes (`DI_Reg & TmpAddr`),
+exactly as `RET`/`JP nn` do, avoiding any register-file read hazard, while
+the cell is also committed to the `H`/`L` register pair using the proven
+`LD HL,(nn)` writeback pattern (so `HL = W`).
+
+**Why `HL = W`:** direct-threaded CamelFORTH runtime words (`DOLIST`/
+`ENTER`, `DOVAR`, `DOCON`, `DODOES`, `EXECUTE`) compute the parameter-field
+address from `W` held in `HL`. A jump-only instruction would break them.
+
+**Size/speed benefit:** replaces the 7-byte inline macro at the end of
+every CODE word with a 2-byte `ED 27` (≈5 bytes saved per primitive, and
+CamelFORTH has 150+ CODE words → ≈750+ bytes saved), collapsing 7
+instructions into one.
+
+**Verification status:** `ghdl -a --std=08 -fsynopsys` accepts the
+modified sources with no errors (only a pre-existing, unrelated `is_cc_true`
+hide-warning remains). Not yet exercised on hardware. **Open item for
+hardware bring-up:** the `H`-byte write commits in TState 1 of the
+following M1 fetch (standard `LD HL,(nn)` timing); confirm via FORTH
+execution that `HL = W` is observable before the next CODE word reads it.
+
+**CamelFORTH side (not done here, HDL-only):** the CamelFORTH `next` macro
+must be redefined to emit the single opcode (`DB 0EDh,27h`) instead of the
+7-instruction sequence. CamelFORTH source is not yet present in this repo
+(the RomWBW/FORTH port is future work).
+
+### Loadable Boot ROM (`.BIN`) and RAM-disk (`.DSK`) images from the OSD — HDL implemented, hardware test pending
+
+The OSD file-download feature is implemented across `MultiComp.sv` (top
+level) and `MicrocomputerZ80CPM.vhd` (CPM core). The user can select a
+`.BIN` boot image and one or more `.DSK` RAM-disk images in the MiSTer OSD;
+both are streamed into SDRAM via the HPS `ioctl` download interface. No
+`sys/` files and no `.qsf`/IP changes were needed (both edited files are
+already in the build; `hps_io` is part of `sys.qip`).
+
+**Config string (`MultiComp.sv`):** two generic load entries added —
+`"F1,BIN;"` (load index 1) and `"F2,DSK;"` (load index 2). The explicit
+index digits give deterministic `ioctl_index[5:0]` values for HDL decode.
+
+**`hps_io` ioctl ports wired:** `ioctl_download`, `ioctl_index`,
+`ioctl_wr`, `ioctl_addr` (27-bit byte offset within the file),
+`ioctl_dout` (8-bit), and `ioctl_wait`. None were connected before.
+
+**Target physical address mapping (`MultiComp.sv`):**
+- `.BIN` (index 1): SDRAM physical `0x000000 + ioctl_addr` (≤512 KB). Boots
+  at `0x0000`.
+- `.DSK` (index 2): SDRAM physical `base + ioctl_addr`, where
+  `base = 128MB - (slot+1)*8MB` and `slot = ioctl_index[15:6]`. The first
+  RAM disk lands in the **top 8 MB** (`0x7800000`); each additional image
+  is placed 8 MB lower. With the single `"F2,DSK;"` entry the slot is 0;
+  adding more `F,DSK` entries (or HPS multi-load) increments the slot
+  automatically — this is the **multi-DSK index decode** (`localparam`s
+  `SDRAM_TOP`/`DSK_IMAGE_SIZE`, wires `dl_dsk_slot`/`dl_dsk_base`).
+
+**Write path:** downloads reuse the **existing CPU-port SDRAM CDC adapter**.
+During any download the whole CPM core is held in reset (the top-level
+`reset` wire now includes `ioctl_download`), so the adapter is otherwise
+idle and there is no contention. A small `clk_sys` handshake FSM latches
+each byte on a synchronized `ioctl_wr` edge, drives the muxed
+`sdram_addr_mux`/`sdram_din_mux`/`sdram_we_mux` (overriding the CPU client
+while `ioctl_download` is high), **holds** the write-request level until the
+adapter pulses `sdram_ready_mux`, and asserts `ioctl_wait` for the whole
+in-flight window so HPS throttles the byte stream until each byte is
+committed.
+
+**Boot-source latch + auto-reset (`MultiComp.sv`):** a `bin_loaded`
+register is set on the falling edge of a `.BIN` download and persists until
+a genuine hard reset (`RESET`/OSD Reset/`status[0]`). A `dl_reset_stretch`
+counter pulses the CPU reset for ~65 k cycles after any download completes
+so the Z-80 restarts cleanly into the new image; this stretch does **not**
+clear `bin_loaded`, so the freshly-loaded BIN boots.
+
+**Critical detail — separate SDRAM init reset:** the SDRAM controller's
+`.init` is driven by a **new, narrower** `sdram_init_reset` wire
+(`RESET | status[0] | buttons[1] | reset_from_mount`) — explicitly NOT the
+expanded `reset` — so the controller is not re-initialized during a
+download (which would wipe the bytes being streamed in) or during the
+post-download CPU-reset stretch.
+
+**CPM core changes (`MicrocomputerZ80CPM.vhd`):** new input port
+`bin_loaded` (defaulted `'0'`). When high:
+- the boot ROM overlay decode (`n_basRomCS`) is forced inactive, and
+- `phys_in_blockram` is forced low so the low 64 KB is served from SDRAM
+  (where the BIN was written) rather than block RAM; `n_internalRam1CS`
+  follows `phys_in_blockram`, so block RAM is deselected automatically and
+  the `cpuDataIn` mux returns `sdramReadData` for `0x0000+`.
+
+Net effect: with a BIN loaded, ROM and block RAM are disabled and the Z-80
+boots the loaded image from physical/logical `0x0000` out of SDRAM, exactly
+as required. With no BIN loaded (`bin_loaded = 0`) behaviour is unchanged
+(built-in 8 KB ROM boot, block RAM at `0x0000`).
+
+**Debug option — `.BIN` into block RAM (OSD `status[13]`).** Early
+hardware testing showed a loaded `.BIN` printing its initial prompt but then
+behaving unpredictably, suggesting either a faulty load or an SDRAM-path
+problem. To isolate the two, a new OSD toggle `"OD,Boot Load Target,SDRAM,
+Block RAM;"` (`status[13]`) routes a `.BIN` into the on-chip 64 KB block RAM
+instead of SDRAM:
+- `MultiComp.sv`: `dl_to_bram = ioctl_download & dl_is_bin & status[13]`.
+  When set, the SDRAM download FSM is idled and a one-cycle-per-byte
+  block-RAM write strobe (`dl_bram_we_r`/`dl_bram_addr_r`/`dl_bram_data_r`,
+  address = `ioctl_addr[15:0]`) is driven into the CPM core. DSK images
+  (8 MB) ignore this and always go to SDRAM.
+- `MicrocomputerZ80CPM.vhd`: new inputs `boot_to_blockram`,
+  `dl_bram_addr/data/we`. The block RAM's `address/data/wren` are muxed to
+  the download port while `dl_bram_we = '1'` (CPU is in reset then, so no
+  contention). When `boot_to_blockram = '1'`, `phys_in_blockram` is NOT
+  forced off by `bin_loaded`, so block RAM stays enabled and serves the low
+  64 KB; only the ROM overlay is disabled, so the BIN runs from `0x0000` out
+  of block RAM. Note the BIN's low 64 KB only fits block RAM, so images
+  larger than 64 KB cannot be fully tested this way — it is purely a
+  diagnostic to confirm the load mechanics and CPU execution independent of
+  SDRAM.
+
+**Hardware test results (current state):**
+- **Block RAM target (`status[13]=1`): WORKS reliably.** A `.BIN` loaded
+  into block RAM boots and runs as expected. This confirms the OSD download
+  mechanics (file streaming, `ioctl_*` decode, `bin_loaded` latch,
+  auto-reset, ROM-overlay disable, and Z-80 execution from `0x0000`) are all
+  correct, and isolates the remaining fault to the **SDRAM data path**.
+- **SDRAM target (`status[13]=0`): DOES NOT WORK.** The same `.BIN` routed
+  into SDRAM does not run correctly. Because the block-RAM path proves the
+  load/decode/boot machinery is sound, the problem is specifically in
+  reading and/or writing SDRAM (controller, CDC adapter handshake, address
+  mapping, or byte lane/timing) — not in the download or boot logic.
+
+**Next diagnostic step — SDRAM memory-test program.** To characterize the
+SDRAM fault independently of the boot image, a standalone Z-80 SDRAM memory
+test (`testing/sdramtest.asm`) is booted from **block RAM** (the known-good
+path) and exercises the SDRAM through the CPU's normal MMU window. It writes
+and reads back known patterns and reports pass/fail and the failing
+address/bit, so we can tell whether the SDRAM is dead, stuck, mis-addressed,
+or bit-laned wrong. See "SDRAM memory-test program" below.
+
+**Verification status:** HDL edits are concurrent-assignment / FSM logic;
+no local simulator is available for this design (`MicrocomputerZ80CPM.vhd`
+pulls in Quartus IP and Synopsys `std_logic_arith`/`std_logic_unsigned`,
+which the installed GHDL cannot analyze; `MultiComp.sv` has no SV linter in
+the environment). Verification is via Quartus compile + DE10-Nano hardware.
+
+**Open items for hardware bring-up:**
+1. ~~Confirm a known-good `.BIN` boots from `0x0000`~~ — **done for block
+   RAM; SDRAM path confirmed broken (see test results above).**
+2. **Diagnose the SDRAM data path** using the block-RAM-booted memory test
+   (`testing/sdramtest.asm`).
+3. Confirm `.DSK` bytes land at physical `0x7800000` (e.g. via the verified
+   MMU direct-access port / a BASIC PEEK through the frame-3 window). Likely
+   blocked behind the SDRAM-path fix.
+4. CDC nicety: `ioctl_wait`/`dl_busy` is generated in `clk_sys` and consumed
+   in hps_io's `CLK_50M` domain (both ~50 MHz PLL taps). It is a slow level
+   and held for the whole transaction, so a direct connection is acceptable
+   for bring-up; revisit with an explicit synchronizer if any
+   write-throttle glitches appear.
+5. **Software (RomWBW side, not HDL):** the RAM-disk driver must access the
+   8 MB image at physical `0x7800000` via the MMU (paging the window) or the
+   MMU direct-access port. Out of scope for this HDL change.
+
+### SDRAM memory-test program (`testing/sdramtest.asm`)
+
+A standalone Z-80 diagnostic that exercises SDRAM independently of the boot
+image, to localize the SDRAM-path fault described above. It is assembled to a
+flat binary and **loaded into block RAM** (OSD "Boot Load Target = Block RAM",
+the known-good path), then run from `0x0000`. It runs **two phases** that reach
+SDRAM by the two different routes the hardware provides, so a pass/fail split
+between them localizes the fault.
+
+Results are printed on the serial console (6850 ACIA, `io2`): status/control
+at `0x82` (bit1 `0x02` = TX-ready/TDRE), data at `0x83`.
+
+#### Phase 1 — direct-access port (small region) — PASSES on hardware
+
+The CPU's low 64 KB of *physical* space is the on-chip block RAM, where the
+test itself runs; SDRAM only exists at physical `0x010000`+. Phase 1 touches
+SDRAM through the **MMU direct-access port** so it never disturbs its own code:
+- `0xB8..0xBB` — 27-bit physical pointer, little-endian (write low byte first).
+- `0xBC` — data port: each `IN`/`OUT` performs a physical memory cycle at the
+  pointer and then **post-increments** the pointer by 1. The CPU is auto
+  wait-stated until the access completes, so no polling is needed.
+
+Region: configurable via `SDB0..SDB3` (base) and `TEST_PAGES`; default 256
+256-byte pages from physical `0x010000` → the first **64 KB** of SDRAM, kept
+small so it finishes quickly. **This phase PASSES on hardware** — the raw SDRAM
+array and the direct-access read/write path are good.
+
+#### Phase 2 — MMU-paged sweep (the path real software uses)
+
+Because Phase 1 passes, the remaining suspect is the **normal paged-access
+path** that CP/M / RomWBW actually use. Phase 2 maps each 16 KB *physical*
+SDRAM page, in turn, into the unused top 16 KB of the Z-80's logical space
+(**frame 3, logical `0xC000..0xFFFF`**) via the MMU mapping registers, then
+tests that page with ordinary CPU memory accesses (`LD (HL),A` / `LD A,(HL)`):
+- Map page `N` into frame 3: `OUT (0xB3),N_lo` (low byte — clears the whole
+  map register first, then sets page bits 7:0) then `OUT (0xB7),N_hi` (high
+  byte — page bits 12:8; `physical_page_bits = 13`).
+- Sweeps every 16 KB SDRAM page above the block-RAM overlap, `PAGE_FIRST=4`
+  (physical `0x010000`) .. `PAGE_LAST=8191` (top of the 128 MB / 27-bit space).
+  Both configurable.
+- Prints a **running per-page progress line** `page NNNN  errs=EEEE` ending in
+  a bare CR so it overwrites in place on a serial terminal, plus a **running
+  16-bit byte-error tally** (`perrcount`).
+
+The program runs from frames 0–2 (`≤0xBFFF`) and the stack/scratch live in
+frame 0, so remapping frame 3 never touches its own code.
+
+#### Tests (comprehensive pattern set, used by both phases)
+
+Each writes the whole region/window then reads it back and verifies:
+1. **Stuck-data fills** `0x00`, `0xFF`, `0xAA`, `0x55` — stuck-at / shorted
+   data bits.
+2. **Address-in-data** — Phase 1: byte = `addr_lo XOR addr_mid`. Phase 2: byte
+   = `logaddr_lo XOR logaddr_hi XOR page_lo`, mixing in the page number so it
+   also catches **page-to-page aliasing** (a page wrongly mapped to another
+   page's storage reads back the wrong value).
+3. **Walking-ones** `01,02,04,…,80` repeating — bit-to-bit shorts / swapped
+   bit lanes.
+
+On the first mismatch of each Phase-1 test it prints
+`MISMATCH @XXXXXX exp=EE got=GG` (physical address, low 24 bits). On the first
+mismatch *per page* in Phase 2 it prints
+`PAGE pppp @LLLL exp=EE got=GG` (physical page number and the LOGICAL window
+address `0xC000..`), then suppresses further detail lines for that page (the
+tally still counts every bad byte). A combined summary prints the Phase-1
+failed-test count and the Phase-2 byte-error count.
+
+#### Build
+
+```sh
+pasmo --bin testing/sdramtest.asm testing/sdramtest.bin
+```
+Produces a ~1.8 KB flat binary (entry `DI; LD SP,0x0A00; …` at `0x0000`).
+`pasmo` is the assembler used (installed from the distro package); no Z-80
+assembler ships in this repo's toolchain otherwise.
+
+#### Interpreting the output
+
+- *Phase 1 passes (confirmed) but Phase 2 fails* → the fault is in the
+  **paged-access path**, i.e. the MMU frame-map → `sdram_addr` translation or
+  the read mux for paged (non-direct) cycles — NOT the raw SDRAM array. This is
+  the same path the boot-from-SDRAM image uses, so it is the prime suspect for
+  the original failure.
+- *Both phases pass* → SDRAM and both access paths are good; the boot-from-
+  SDRAM failure is then most likely in the **download write FSM / CDC
+  handshake** (`dl_we` hold vs `sdram_ready_mux`), the
+  **`bin_loaded`/`phys_in_blockram` switch-over** that re-routes `0x0000` to
+  SDRAM, or **timing** of the streamed write vs the auto-reset.
+- *Stuck-data fails (all same bit)* → dead/stuck data lane or the controller
+  never completing the cycle.
+- *Address-in-data fails but fills pass* → address-line / decode / aliasing
+  fault (within a page, or page-to-page in Phase 2).
+- *Walking-ones fails* → adjacent data-bit short or swapped byte lanes.
+
 ### Known issues (acknowledged, not blocking)
 
 #### Pre-existing setup-timing violation in `SBCTextDisplayRGB`
@@ -656,6 +932,18 @@ real-world misbehaviour:
 7. **Clean-up legacy memory device** in `MicrocomputerZ80CPM.vhd` - 
    remove references to externalRam (`n_externalRamCS` and varous 
    `internalRam2` related signals.
+8. **FORTH `NEXT` instruction (`ED 27`) hardware bring-up**: the T80
+   microcode is implemented and GHDL-verified, but not yet tested on
+   silicon. Confirm `HL = W`, `IP += 2`, and `PC := W` behave correctly,
+   then redefine the CamelFORTH `next` macro to emit `DB 0EDh,27h` and
+   re-run the FORTH test suite.
+9. **Loadable Boot ROM (`.BIN`) / RAM-disk (`.DSK`) from OSD hardware
+   bring-up**: HDL implemented across `MultiComp.sv` and
+   `MicrocomputerZ80CPM.vhd` (see the progress entry above). Quartus-compile
+   and test on silicon: (a) load a known `.BIN`, confirm it boots from
+   `0x0000` after the auto-reset and that `bin_loaded` clears on OSD Reset;
+   (b) load a `.DSK`, confirm bytes land at physical `0x7800000`; (c) wire
+   the RomWBW RAM-disk driver to that physical base (software).
 
 ---
 
@@ -731,5 +1019,4 @@ widening work, for whoever picks it up next.
 4. **Begin the RomWBW port** — the original project goal. The 128 MB
    paged-memory foundation (MMU + SDRAM, with a verified direct-access
    window for inter-bank copies) is now in place to host it.
-5. **Remove ch376 peripheral** - no need for this USB hardware interface.
-6. **Remove MultiComputerZ80BASIC configuration**
+

@@ -1,0 +1,71 @@
+10 REM === MMU direct-access window test ===
+20 REM BC=data port (R/W phys mem, ptr post-incs)
+30 REM B8 B9 BA BB = ptr bytes 7:0 15:8 23:16 31:24
+40 REM frame3 window C000 -> phys page*16384
+50 ER=0
+60 REM --- T1: single byte R/W via direct access
+70 REM phys page 100 base = &H190000
+100 P0=0 : P1=0 : P2=&H19 : P3=0
+110 GOSUB 2000
+120 OUT &HBC,&H5A
+130 GOSUB 2000
+140 V=INP(&HBC) : EX=&H5A : T$="T1 byte R/W"
+150 GOSUB 3000
+160 REM --- T2: pointer post-increment
+190 P0=0 : P1=0 : P2=&H19 : P3=0
+200 GOSUB 2000
+210 OUT &HBC,&H11 : OUT &HBC,&H22
+215 OUT &HBC,&H33 : OUT &HBC,&H44
+230 GOSUB 2000
+240 A=INP(&HBC) : B=INP(&HBC)
+245 C=INP(&HBC) : D=INP(&HBC)
+250 PRINT "T2 ";HEX$(A);HEX$(B);HEX$(C);HEX$(D);
+255 PRINT " want 11 22 33 44"
+260 OK=1
+262 IF A<>&H11 THEN OK=0
+264 IF B<>&H22 THEN OK=0
+266 IF C<>&H33 THEN OK=0
+268 IF D<>&H44 THEN OK=0
+270 IF OK=0 THEN PRINT "T2 FAIL" : ER=ER+1
+275 IF OK=1 THEN PRINT "T2 OK post-increment"
+280 REM --- T3: direct write vs PEEK window
+310 P0=0 : P1=0 : P2=&H19 : P3=0
+320 GOSUB 2000
+330 OUT &HBC,&H7E : OUT &HBC,&H81
+350 OUT &HB3,&H64 : OUT &HB7,0
+360 V=PEEK(&HC000) : EX=&H7E : T$="T3a window lo"
+365 GOSUB 3000
+367 V=PEEK(&HC001) : EX=&H81 : T$="T3b window hi"
+369 GOSUB 3000
+400 REM --- T4: POKE window, read via direct
+430 POKE &HC002,&HBE : POKE &HC003,&HEF
+440 P0=2 : P1=0 : P2=&H19 : P3=0
+450 GOSUB 2000
+460 V=INP(&HBC) : EX=&HBE : T$="T4a direct lo"
+465 GOSUB 3000
+467 V=INP(&HBC) : EX=&HEF : T$="T4b direct hi"
+469 GOSUB 3000
+500 REM --- T5: high addr, upper SDRAM device
+520 REM page 5000 base = &H04E20000
+530 P0=0 : P1=0 : P2=&HE2 : P3=4
+540 GOSUB 2000
+550 OUT &HBC,&HC3 : OUT &HBC,&H3C
+560 GOSUB 2000
+570 V=INP(&HBC) : EX=&HC3 : T$="T5a high lo"
+575 GOSUB 3000
+577 V=INP(&HBC) : EX=&H3C : T$="T5b high hi"
+579 GOSUB 3000
+620 PRINT
+630 IF ER=0 THEN PRINT "ALL TESTS PASSED"
+640 IF ER>0 THEN PRINT "FAILURES: ";ER
+650 END
+2000 REM set ptr = P3:P2:P1:P0 (low first)
+2010 OUT &HB8,P0 : OUT &HB9,P1
+2020 OUT &HBA,P2 : OUT &HBB,P3
+2030 RETURN
+3000 REM verify V vs EX, label T$
+3010 IF V=EX THEN PRINT T$;" OK" : RETURN
+3020 PRINT T$;" FAIL want ";HEX$(EX);
+3030 PRINT " got ";HEX$(V)
+3040 ER=ER+1
+3050 RETURN

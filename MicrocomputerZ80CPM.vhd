@@ -83,7 +83,27 @@ entity MicrocomputerZ80CPM is
 		sdram_we		: out std_logic;
 		sdram_rd		: out std_logic;
 		sdram_dout		: in  std_logic_vector(7 downto 0);
-		sdram_ready		: in  std_logic
+		sdram_ready		: in  std_logic;
+
+		-- High when a .BIN boot image has been downloaded from the MiSTer
+		-- OSD. When set, the built-in 8 KB boot ROM overlay is disabled so
+		-- the Z-80 boots the loaded image from 0x0000 instead of the ROM.
+		bin_loaded		: in  std_logic := '0';
+
+		-- Debug aid: when high, the .BIN was loaded into the on-chip 64 KB
+		-- block RAM (which stays enabled) rather than SDRAM. Lets us
+		-- isolate whether unpredictable behaviour comes from the SDRAM path
+		-- or the load itself. When low (default), bin_loaded routes the low
+		-- 64 KB to SDRAM and disables block RAM as before.
+		boot_to_blockram	: in  std_logic := '0';
+
+		-- Block-RAM download write port (MiSTer ioctl side). Active only
+		-- while a .BIN download targeting block RAM is in progress; the
+		-- Z-80 is held in reset then, so there is no contention with the
+		-- CPU's own block-RAM accesses.
+		dl_bram_addr	: in  std_logic_vector(15 downto 0) := (others => '0');
+		dl_bram_data	: in  std_logic_vector(7 downto 0)  := (others => '0');
+		dl_bram_we		: in  std_logic := '0'
 		);
 end MicrocomputerZ80CPM;
 
@@ -102,9 +122,12 @@ architecture struct of MicrocomputerZ80CPM is
 	signal basRomData				: std_logic_vector(7 downto 0);
 	signal internalRam1DataOut		: std_logic_vector(7 downto 0);
 	signal internalRam2DataOut		: std_logic_vector(7 downto 0);
+	-- Block RAM port muxed between the CPU and the OSD download write path.
+	signal bram_address				: std_logic_vector(15 downto 0);
+	signal bram_data				: std_logic_vector(7 downto 0);
+	signal bram_wren				: std_logic;
 	signal interface1DataOut		: std_logic_vector(7 downto 0);
 	signal interface2DataOut		: std_logic_vector(7 downto 0);
---	signal ch376sDataOut			: std_logic_vector(7 downto 0);
 	signal sdCardDataOut			: std_logic_vector(7 downto 0);
 	signal fpLatchDataOut			: std_logic_vector(7 downto 0);
 	signal fpSubsysDataOut			: std_logic_vector(7 downto 0);
@@ -127,7 +150,6 @@ architecture struct of MicrocomputerZ80CPM is
 	signal n_basRomCS				: std_logic :='1';
 	signal n_interface1CS			: std_logic :='1';
 	signal n_interface2CS			: std_logic :='1';
---	signal n_ch376sCS				: std_logic :='1';
 	signal n_sdCardCS				: std_logic :='1';
 	signal n_fpLatchCS				: std_logic :='1';   -- I/O port 0x47 latch
 	signal n_fpSubsysCS				: std_logic :='1';   -- FrontPanel_Subsystem 8-port window at 0xA0..0xA7
@@ -186,7 +208,7 @@ architecture struct of MicrocomputerZ80CPM is
 	signal fpChainLatch				: std_logic;
 	signal fpChainShiftEn			: std_logic;
 
-    signal serialClkCount           : unsigned(15 downto 0);
+	signal serialClkCount				: unsigned(15 downto 0);
 	signal cpuClkCount				: std_logic_vector(5 downto 0); 
 	signal sdClkCount				: std_logic_vector(5 downto 0); 	
 	signal cpuClock					: std_logic;
@@ -196,27 +218,6 @@ architecture struct of MicrocomputerZ80CPM is
 	--CPM
 	signal n_RomActive 				: std_logic := '0';
 
-	-- component ch376s_module is
-	-- 	port (
-	-- 		-- interface
-	-- 		clk : 	in std_logic;
-	-- 		rd : 	in std_logic;
-	-- 		wr : 	in std_logic;
-	-- 		reset : in std_logic;
-	-- 		a0 : 	in std_logic;
-			
-	-- 		-- SPI wires
-	-- 		sck : 	out std_logic;
-	-- 		sdcs : 	out std_logic;
-	-- 		sdo : 	out std_logic; -- reg
-	-- 		sdi : 	in std_logic;
-			
-	-- 		-- data
-	-- 		din : 	in std_logic_vector (7 downto 0);
-	-- 		dout : 	out std_logic_vector (7 downto 0) -- reg
-	-- 	);
-	-- end component;
-	
 	
 begin
 	--CPM
@@ -306,7 +307,15 @@ port map(
 -- memory (the first four 16 KB pages). Everything else is SDRAM.
 -- All physical bits above bit 15 must be zero to hit block RAM, so high
 -- SDRAM pages never alias into it.
-phys_in_blockram <= '1' when mmu_phys_addr(26 downto 16) = "00000000000" else '0';
+-- When a .BIN boot image is loaded into SDRAM (boot_to_blockram = '0'),
+-- the low 64 KB is served from SDRAM (where the BIN was written), so block
+-- RAM is taken out of the physical map entirely and all accesses route to
+-- SDRAM. When the BIN is instead loaded into block RAM (boot_to_blockram =
+-- '1', debug mode), block RAM STAYS enabled and serves the low 64 KB as
+-- normal -- only the ROM overlay is disabled (see n_basRomCS) so the BIN
+-- runs from 0x0000 out of block RAM.
+phys_in_blockram <= '1' when mmu_phys_addr(26 downto 16) = "00000000000"
+                            and (bin_loaded = '0' or boot_to_blockram = '1') else '0';
 phys_in_sdram    <= not phys_in_blockram;
 
 -- Combined wait_n into the CPU. cpu_wait_n = '0' stalls the Z-80.
@@ -329,13 +338,20 @@ port map(
 -- Writes are qualified by both the memory-write strobe and the physical
 -- decode (phys_in_blockram); the ROM overlay at logical 0x0000-0x1FFF
 -- still wins on the cpuDataIn mux while n_RomActive = '0'.
+-- During a block-RAM-targeted .BIN download the CPU is in reset, so the
+-- download write port drives the block RAM's address/data/wren. Otherwise
+-- the CPU's MMU-translated physical address and write strobe are used.
+bram_address <= dl_bram_addr when dl_bram_we = '1' else mmu_phys_addr(15 downto 0);
+bram_data    <= dl_bram_data when dl_bram_we = '1' else cpuDataOut;
+bram_wren    <= '1' when dl_bram_we = '1' else not(n_memWR or n_internalRam1CS);
+
 ram1: entity work.InternalRam64K
 port map
 (
-	address => mmu_phys_addr(15 downto 0),
+	address => bram_address,
 	clock => clk,
-	data => cpuDataOut,
-	wren => not(n_memWR or n_internalRam1CS),
+	data => bram_data,
+	wren => bram_wren,
 	q => internalRam1DataOut
 );
 
@@ -409,23 +425,6 @@ port map(
         clk => clk
     );
 
--- usb : ch376s_module
--- port map (
--- 	sdcs	=> 	usbCS,
--- 	sdo 	=> 	usbMOSI,
--- 	sdi 	=> 	usbMISO,
--- 	sck 	=> 	usbSCLK,
-
--- 	wr 		=> 	not (n_ch376sCS or n_ioWR),
--- 	rd 		=> 	not (n_ch376sCS or n_ioRD),
-
--- 	dout 	=> 	ch376sDataOut,
--- 	din 	=> 	cpuDataOut,
-	
--- 	a0 		=> 	cpuAddress (0),
--- 	reset 	=> 	not (N_RESET),
--- 	clk 	=> 	sdClock -- twice the spi clk
--- );
 
 -- ____________________________________________________________________________________
 -- FRONT PANEL GOES HERE
@@ -525,10 +524,9 @@ n_memRD <= n_RD or n_MREQ;
 -- The ROM data wins on the cpuDataIn mux while n_RomActive = '0'; this is
 -- how the bootloader runs before it has had a chance to set up the MMU
 -- or copy code into RAM.
-n_basRomCS <= '0' when cpuAddress(15 downto 13) = "000" and n_memRD='0' and n_RomActive = '0' else '1'; --8K at bottom of memory
+n_basRomCS <= '0' when cpuAddress(15 downto 13) = "000" and n_memRD='0' and n_RomActive = '0' and bin_loaded = '0' else '1'; --8K at bottom of memory (disabled when a BIN boot image is loaded)
 n_interface1CS <= '0' when cpuAddress(7 downto 1) = "1000000" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 2 Bytes $80-$81
 n_interface2CS <= '0' when cpuAddress(7 downto 1) = "1000001" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 2 Bytes $82-$83
--- n_ch376sCS <= '0' when cpuAddress(7 downto 1) = "0010000" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 2 Bytes $20-$21
 n_sdCardCS <= '0' when cpuAddress(7 downto 3) = "10001" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 8 Bytes $88-$8F
 n_fpLatchCS <= '0' when cpuAddress(7 downto 0) = x"47" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 1 Byte $47 (front-panel data latch)
 n_fpSubsysCS <= '0' when cpuAddress(7 downto 3) = "10100" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 8 Bytes $A0-$A7 (front-panel subsystem)
@@ -556,17 +554,16 @@ n_internalRam1CS <= '0' when phys_in_blockram = '1' else '1';
     --   * ROM overlay at logical 0x0000-0x1FFF wins over RAM.
     --   * Physical-memory path: block RAM for phys < 0x010000, SDRAM
     --     otherwise.
-    cpuDataIn <= interface1DataOut when (n_interface1CS = '0') else
-                 interface2DataOut when (n_interface2CS = '0') else
---                 ch376sDataOut when (n_ch376sCS = '0') else
-                 sdCardDataOut when (n_sdCardCS = '0') else
-                 fpLatchDataOut when (n_fpLatchCS = '0') else
-                 fpSubsysDataOut when (n_fpSubsysCS = '0') else
-                 mmu_dataOut when (mmu_io_cs = '1' and cpuAddress(3 downto 0) /= "1100") else
-                 basRomData when (n_basRomCS = '0') else
+    cpuDataIn <= interface1DataOut   when (n_interface1CS = '0') else
+                 interface2DataOut   when (n_interface2CS = '0') else
+                 sdCardDataOut       when (n_sdCardCS = '0') else
+                 fpLatchDataOut      when (n_fpLatchCS = '0') else
+                 fpSubsysDataOut     when (n_fpSubsysCS = '0') else
+                 mmu_dataOut         when (mmu_io_cs = '1' and cpuAddress(3 downto 0) /= "1100") else
+                 basRomData          when (n_basRomCS = '0') else
                  internalRam1DataOut when (phys_in_blockram = '1') else
-                 sdramReadData when (phys_in_sdram = '1') else
-                 sramData when (n_externalRamCS = '0') else
+                 sdramReadData       when (phys_in_sdram = '1') else
+                 sramData            when (n_externalRamCS = '0') else
                  x"FF";
 
 -- ____________________________________________________________________________________

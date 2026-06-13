@@ -321,7 +321,7 @@ assign sdram_dout_mux  = ram_byte;
 
 sdram_32r8w sdram_inst
 (
-	.init        (reset),
+	.init        (sdram_init_reset),
 	.clk         (clk_ram),
 
 	.SDRAM_DQ    (SDRAM_DQ),
@@ -383,6 +383,9 @@ assign AUDIO_MIX = 0;
 parameter CONF_STR = {
 	"MultiComp;;",
 	"S,IMG;",
+	"FC1,BINROM,Boot Rom Image;",                        // index 1: boot ROM image -> SDRAM @ 0x000000 (or block RAM if OD set)
+	"FC2,DSK,8MB Disk Image;",                        // index 2: RAM-disk image -> SDRAM, top 8 MB first
+	"OD,Boot Load Target,SDRAM,Block RAM;",           // status[13]: 0=BIN->SDRAM, 1=BIN->block RAM (debug)
 	"OF,Reset after Mount,No,Yes;", 
 	"-;",
 	"O68,CPU-ROM,Z80-CP/M;",
@@ -395,6 +398,13 @@ parameter CONF_STR = {
 	"V,v",`BUILD_DATE
 };
 
+// Status Bit Map:
+//             Upper                             Lower              
+// 0         1         2         3          4         5         6   
+// 01234567890123456789012345678901 23456789012345678901234567890123
+// 0123456789ABCDEFGHIJKLMNOPQRSTUV 0123456789ABCDEFGHIJKLMNOPQRSTUV
+// X     XXXXXXX XX
+   
 //////////////////   HPS I/O   ///////////////////
 wire  [1:0] buttons;
 wire [127:0] status;
@@ -416,6 +426,15 @@ wire        sd_ack_conf;
 wire        img_mounted;
 wire        img_readonly;
 wire [63:0] img_size;
+
+// ARM -> FPGA download (OSD-loaded .BIN boot image / .DSK RAM-disk image).
+// These run in the CLK_50M domain (hps_io.clk_sys = CLK_50M below).
+wire        ioctl_download;
+wire [15:0] ioctl_index;
+wire        ioctl_wr;
+wire [26:0] ioctl_addr;
+wire  [7:0] ioctl_dout;
+wire        ioctl_wait;
 
 hps_io #(
 	.CONF_STR(CONF_STR),
@@ -443,7 +462,14 @@ hps_io #(
 
 	.img_mounted(img_mounted),
 	.img_readonly(img_readonly),
-	.img_size(img_size)
+	.img_size(img_size),
+
+	.ioctl_download(ioctl_download),
+	.ioctl_index(ioctl_index),
+	.ioctl_wr(ioctl_wr),
+	.ioctl_addr(ioctl_addr),
+	.ioctl_dout(ioctl_dout),
+	.ioctl_wait(ioctl_wait)
 );
 
 ///////////////////////   CLOCKS   ///////////////////////////////
@@ -514,7 +540,49 @@ always @(posedge clk_sys) begin
     end
 end
 
-wire reset = RESET | status[0] | buttons[1] | reset_from_mount;
+// ---- OSD-download boot-source latch and post-download auto-reset ----
+//
+// bin_loaded persists the "boot from the loaded .BIN" decision: it is set
+// when a .BIN download finishes and stays set until a deliberate hard reset
+// (RESET / OSD Reset / status[0]). The post-download auto-reset below only
+// pulses the CPU reset, so the freshly-loaded BIN boots without clearing
+// the flag.
+reg        bin_loaded = 1'b0;
+reg        ioctl_download_d = 1'b0;
+reg        dl_reset_stretch = 1'b0;
+reg [15:0] dl_reset_counter = 16'd0;
+always @(posedge clk_sys) begin
+    ioctl_download_d <= ioctl_download;
+
+    // Hard reset clears the boot-source latch (return to built-in ROM).
+    if (RESET | status[0] | buttons[1]) begin
+        bin_loaded <= 1'b0;
+    end else if (ioctl_download_d & ~ioctl_download & dl_is_bin) begin
+        // Falling edge of a .BIN download: latch boot-from-BIN.
+        bin_loaded <= 1'b1;
+    end
+
+    // On the falling edge of ANY download, hold the CPU in reset for a
+    // short stretch so it restarts cleanly into the new memory image.
+    if (ioctl_download_d & ~ioctl_download) begin
+        dl_reset_stretch <= 1'b1;
+        dl_reset_counter <= 16'd0;
+    end else if (dl_reset_stretch) begin
+        if (dl_reset_counter < 16'hffff)
+            dl_reset_counter <= dl_reset_counter + 1'b1;
+        else
+            dl_reset_stretch <= 1'b0;
+    end
+end
+
+// CPU is held in reset during a download and for the post-download stretch.
+wire reset = RESET | status[0] | buttons[1] | reset_from_mount
+           | ioctl_download | dl_reset_stretch;
+
+// The SDRAM controller must NOT be re-initialized during a download (that
+// would wipe the bytes we are streaming in) or during the post-download
+// CPU-reset stretch. Its init is driven only by the genuine hard resets.
+wire sdram_init_reset = RESET | status[0] | buttons[1] | reset_from_mount;
 
 /////////////////  SDCARD  ////////////////////////
 
@@ -755,13 +823,118 @@ begin
     fpLED_serial <= _fpLED_serial[cpu_type];
 end
 
+//////////////  OSD FILE DOWNLOAD -> SDRAM  ///////////////
+//
+// .BIN boot images and .DSK RAM-disk images selected in the OSD are
+// streamed in by hps_io as a byte stream (ioctl_wr pulses, ioctl_addr =
+// byte offset within the file). We write each byte into SDRAM through the
+// SAME CPU-port CDC adapter used by the Z-80 client: during a download the
+// CPU is held in reset (see RESET section), so the adapter is otherwise
+// idle and there is no contention.
+//
+// Target physical address:
+//   .BIN (index 1): physical 0x000000 + ioctl_addr   (boots at 0x0000)
+//   .DSK (index 2): physical base + ioctl_addr, where the first RAM-disk
+//                   sits in the top 8 MB and each further image is placed
+//                   8 MB lower. The extra-image slot number comes from the
+//                   upper bits of ioctl_index (ioctl_index[15:6]); with a
+//                   single "F2,DSK;" entry that field is 0, giving the
+//                   top-8 MB base. Adding more "F,DSK;" config entries (or
+//                   HPS multi-load) increments the slot automatically.
+
+localparam [26:0] SDRAM_TOP      = 27'h8000000;          // 128 MB
+localparam [26:0] DSK_IMAGE_SIZE = 27'h0800000;          //   8 MB
+
+// ioctl_index from hps_io will be: 
+//        ioctl_index[5:0] = index(explicit or auto)
+//        ioctl_index[7:6] = extension index   
+
+wire        dl_is_bin  = (ioctl_index[5:0] == 6'd1);
+wire        dl_is_dsk  = (ioctl_index[5:0] == 6'd2);
+wire [9:0]  dl_dsk_slot = ioctl_index[15:6];             // 0 = first DSK
+// base = 128MB - (slot+1)*8MB  -> first DSK at 0x7800000 (top 8 MB)
+wire [26:0] dl_dsk_base = SDRAM_TOP - ((dl_dsk_slot + 1'b1) * DSK_IMAGE_SIZE);
+wire [26:0] dl_addr     = dl_is_dsk ? (dl_dsk_base + ioctl_addr) : ioctl_addr;
+
+// Debug option (status[13]): when set, a .BIN is loaded into the on-chip
+// 64 KB block RAM (low 16 bits of the file offset) instead of SDRAM. Block
+// RAM stays enabled, so this isolates a faulty SDRAM path from a faulty
+// load. Only BIN images use this; DSK images are 8 MB and always go to
+// SDRAM. A block-RAM write completes in one cycle, so it bypasses the
+// SDRAM handshake below.
+wire        dl_to_bram = ioctl_download & dl_is_bin & status[13];
+
+// Synchronize the ioctl_wr strobe (CLK_50M domain) into clk_sys and
+// edge-detect it. CLK_50M and clk_sys are both ~50 MHz PLL taps but are
+// distinct nets, so treat the crossing conservatively.
+reg  [2:0]  iowr_sync = 3'b000;
+always @(posedge clk_sys) iowr_sync <= {iowr_sync[1:0], ioctl_wr};
+wire        dl_wr_edge = iowr_sync[1] & ~iowr_sync[2];
+
+// Download write handshake (clk_sys). On each ioctl_wr, latch addr/data,
+// raise dl_we and HOLD it high for the whole transaction. The CDC adapter
+// sees dl_we (via sdram_we_mux) as a held request level: it 2-FF
+// synchronizes it into clk_ram, edge-detects the rise, and drives the
+// controller; it pulses sdram_ready_mux back when the write completes.
+// dl_we must stay high until that completion (exactly like the Z-80
+// client's sdram_we_reg), so a single-cycle pulse is NOT sufficient.
+// ioctl_wait is asserted for the whole busy window so HPS pauses the
+// byte stream until each byte is committed.
+reg         dl_we      = 1'b0;
+reg  [26:0] dl_addr_r  = 27'd0;
+reg  [7:0]  dl_din_r   = 8'h00;
+reg         dl_busy    = 1'b0;
+always @(posedge clk_sys) begin
+	if (!ioctl_download || dl_to_bram) begin
+		// Idle the SDRAM download FSM during block-RAM-targeted loads.
+		dl_we   <= 1'b0;
+		dl_busy <= 1'b0;
+	end else if (!dl_busy) begin
+		if (dl_wr_edge) begin
+			dl_addr_r <= dl_addr;
+			dl_din_r  <= ioctl_dout;
+			dl_we     <= 1'b1;   // held until completion
+			dl_busy   <= 1'b1;
+		end
+	end else begin
+		// in-flight: hold the request level until the controller reports
+		// completion, then drop it so the adapter clears its edge-detect.
+		if (sdram_ready_mux) begin
+			dl_we   <= 1'b0;
+			dl_busy <= 1'b0;
+		end
+	end
+end
+
+// Block-RAM download write strobe: one clk_sys pulse per ioctl byte. Block
+// RAM accepts a write every cycle, so no handshake/stall is needed; just
+// register the byte+address aligned with the write enable.
+reg         dl_bram_we_r   = 1'b0;
+reg  [15:0] dl_bram_addr_r = 16'd0;
+reg  [7:0]  dl_bram_data_r = 8'h00;
+always @(posedge clk_sys) begin
+	dl_bram_we_r <= 1'b0;
+	if (dl_to_bram && dl_wr_edge) begin
+		dl_bram_addr_r <= ioctl_addr[15:0];
+		dl_bram_data_r <= ioctl_dout;
+		dl_bram_we_r   <= 1'b1;
+	end
+end
+
+// Hold HPS off until the byte is committed. SDRAM path uses the busy
+// window; block-RAM path completes immediately (single-cycle write).
+assign ioctl_wait = dl_busy;
+
 // SDRAM client mux: only the CPM core currently has SDRAM ports wired,
-// so gate strobes by cpu_type == cpuZ80CPM. Address/data/dout/ready can
+// so gate strobes by cpu_type == cpuZ80CPM. During an OSD download the
+// download path overrides the CPU client (CPU is in reset). Address/data
 // pass through unconditionally; with we=rd=0 the controller stays idle.
-assign sdram_addr_mux  = _sdram_addr[cpu_type];
-assign sdram_din_mux   = _sdram_din [cpu_type];
-assign sdram_we_mux    = _sdram_we  [cpu_type] & (cpu_type == cpuZ80CPM);
-assign sdram_rd_mux    = _sdram_rd  [cpu_type] & (cpu_type == cpuZ80CPM);
+assign sdram_addr_mux  = ioctl_download ? dl_addr_r : _sdram_addr[cpu_type];
+assign sdram_din_mux   = ioctl_download ? dl_din_r  : _sdram_din [cpu_type];
+assign sdram_we_mux    = ioctl_download ? dl_we
+                                        : (_sdram_we[cpu_type] & (cpu_type == cpuZ80CPM));
+assign sdram_rd_mux    = ioctl_download ? 1'b0
+                                        : (_sdram_rd[cpu_type] & (cpu_type == cpuZ80CPM));
 
 
 MicrocomputerZ80CPM MicrocomputerZ80CPM
@@ -794,7 +967,12 @@ MicrocomputerZ80CPM MicrocomputerZ80CPM
     .sdram_we   (_sdram_we  [cpuZ80CPM]),
     .sdram_rd   (_sdram_rd  [cpuZ80CPM]),
     .sdram_dout (sdram_dout_mux),
-    .sdram_ready(sdram_ready_mux)
+    .sdram_ready(sdram_ready_mux),
+    .bin_loaded (bin_loaded),
+    .boot_to_blockram(status[13]),
+    .dl_bram_addr(dl_bram_addr_r),
+    .dl_bram_data(dl_bram_data_r),
+    .dl_bram_we  (dl_bram_we_r)
 );
 
 video_cleaner video_cleaner
