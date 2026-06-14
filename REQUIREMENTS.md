@@ -466,6 +466,319 @@ The MMU module itself needed no width edits — it is parameterised by the
 generic. 8192 pages x 16 KB = 128 MB; pages 0..3 (physical
 0x000000..0x00FFFF) remain block RAM, pages 4..8191 are SDRAM.
 
+### Block RAM relocated above SDRAM + MMU widened to 14 bits (256 MB)
+
+The 64 KB on-chip block RAM (`InternalRam64K`) used to occupy physical page
+0 and shadow the bottom 64 KB of the 128 MB SDRAM, making that SDRAM
+unreachable. It has been **relocated to its own physical page above the
+SDRAM** so the full 128 MB of SDRAM is contiguously addressable with no
+shadowing, and so the boot source is chosen purely by the MMU's default
+mapping rather than by external "force block RAM on/off" control signals.
+
+Note on terminology: the relocated component is the **64 KB read/write
+block RAM**, not the 8 KB boot ROM (`Z80_CPM_BASIC_ROM`). The 8 KB ROM
+overlay at logical `0x0000..0x1FFF` is unchanged.
+
+Physical memory layout (28-bit / 256 MB space):
+
+| Physical address | Contents |
+|---|---|
+| `0x0000000 – 0x7FFFFFF` | 128 MB SDRAM (pages 0..8191), now fully addressable |
+| `0x8000000 – 0x800FFFF` | Relocated 64 KB block RAM (page 8192), just above SDRAM |
+| `0x8010000 – 0xFFFFFFF` | Unmapped |
+
+**MMU changes (`Components/alancox/MMU.vhd`):**
+- New generic `block_ram_page` (default 8192): physical page of the
+  relocated block RAM, used by the reset map.
+- New input `bin_loaded`: selects the reset mapping of frame 0.
+- **Reset map** is no longer identity. Frame 0 → `block_ram_page` (so the
+  Z-80 boots from block RAM at logical `0x0000`) when `bin_loaded = '0'`,
+  or → SDRAM physical page 0 when `bin_loaded = '1'` (a `.BIN` was loaded
+  into SDRAM at physical `0x0000`). Frames 1..3 → SDRAM physical pages
+  1..3 (logical `0x4000..0xFFFF` = SDRAM low memory).
+- The module is still fully parameterised; the 4-byte direct-access pointer
+  ports and `+4..+7` extension ports already guard against the wider
+  register width, so no further width edits were needed. GHDL
+  (`ghdl -a/-e --std=08`) analyzes and elaborates the widened MMU cleanly.
+
+**Wrapper changes (`MicrocomputerZ80CPM.vhd`):**
+- `mmu1` generics `physical_page_bits => 14, block_ram_page => 8192`
+  (28-bit / 256 MB physical address space).
+- `mmu_phys_addr` widened to `std_logic_vector(27 downto 0)` (28 bits).
+- New **disjoint** physical decode: `phys_in_blockram` =
+  `mmu_phys_addr(27 downto 16) = "100000000000"` (the 64 KB window at
+  `0x8000000`); `phys_in_sdram` = `mmu_phys_addr(27) = '0'` (low 128 MB).
+  The `bin_loaded`/`boot_to_blockram` terms were removed from
+  `phys_in_blockram` — whether logical `0x0000` resolves to block RAM or
+  SDRAM is now decided solely by the MMU's frame-0 mapping.
+- `sdram_addr <= mmu_phys_addr(26 downto 0)` — SDRAM accesses always have
+  bit 27 = 0, so the low 27 bits fully address the controller; the
+  `MicrocomputerZ80CPM` `sdram_addr` port and the SDRAM controller stay
+  27-bit/128 MB (unchanged).
+- `mmu_bin_loaded <= bin_loaded and not boot_to_blockram`: the
+  frame-0→SDRAM remap is suppressed in the block-RAM debug-boot path so
+  frame 0 stays on the block RAM page (where the debug BIN was written).
+- The block-RAM debug download path (`boot_to_blockram` / `dl_bram_*`) is
+  retained as the known-good comparison path for SDRAM diagnostics.
+
+The `MultiComp.sv` top level needed no port-width changes (the core's
+`sdram_addr` port is still 27-bit); it only gained the SDRAM-boot fix
+below.
+
+### SDRAM boot-from-`.BIN` non-determinism — root cause and fix
+
+**Symptom:** a `.BIN` booted from **block RAM** ran reliably, but the same
+`.BIN` streamed into **SDRAM** booted non-deterministically — yet the
+standalone Z-80 SDRAM memory test (`testing/sdramtest.asm`) passed both its
+direct-access and MMU-paged phases. So the raw SDRAM array and both CPU
+read/write paths are good; the fault was specific to the **OSD download
+write path**, the one thing the memory test does not exercise.
+
+**Root cause:** the imported `sdram_32r8w` controller
+(`Components/SDRAM/sdram2.sv`) asserts its write completion
+(`sdram_cpu_ready`, source of `sdram_ready_mux`) in `STATE_RW1` — the cycle
+the `WRITE` command is issued — and only *then* walks `STATE_DLY1 →
+STATE_DLY2 → STATE_IDLE`. "Ready" is therefore raised **before** the
+write's auto-precharge / write-recovery (tWR/tRP) has elapsed and before
+the controller can accept the next command. The Z-80 client never tripped
+this because each CPU write is paced by a whole instruction, but the OSD
+download FSM (`MultiComp.sv`) streams bytes back-to-back: it dropped
+`dl_we` on `sdram_ready_mux` and re-raised it on the very next byte, so the
+next `ACTIVE` could be launched before the previous write settled,
+corrupting the loaded image.
+
+**Fix (`MultiComp.sv` download FSM, low-risk — the imported controller is
+left untouched):** after each streamed write completes, the FSM now holds
+`dl_busy`/`ioctl_wait` for a short fixed **recovery cooldown**
+(`DL_WR_COOLDOWN = 8` `clk_sys` cycles) before accepting the next byte.
+At 50 MHz `clk_sys` vs ~100 MHz `clk_ram`, 8 cycles comfortably span the
+controller's `DLY1/DLY2` + recovery window with margin, and they also
+guarantee `dl_we` is low long enough for the `clk_ram` CDC edge-detector to
+see two distinct write requests (closing a secondary back-to-back
+edge-merge hazard). This keeps the CPU-paced client path — proven by the
+memory test — unchanged.
+
+**Diagnostic note (if boot still fails after this):** the next suspect is
+the post-download `bin_loaded` / frame-0 switch-over. After a download the
+top level pulses the CPU reset (`dl_reset_stretch`) while `bin_loaded`
+latches; the MMU reset map reads `bin_loaded` (via `mmu_bin_loaded`) at the
+reset edge, so frame 0 must already reflect the loaded BIN when reset
+deasserts. To localize: have the block-RAM-resident memory test read back
+the just-written SDRAM region via the direct-access port and compare — a
+clean readback isolates the fault to the switch-over rather than the write
+path.
+
+### SDRAM *execution* test (`testing/sdramexec.asm`) — fetch-from-SDRAM diagnostic
+
+After the relocation/widening and the download-FSM cooldown fix, a `.BIN`
+still ran from **block RAM** but not from **SDRAM**, while the SDRAM
+**memory** tests (`testing/sdramtest.asm`) continued to pass. The memory
+tests only ever do **data** accesses (`LD (HL),A` / `LD A,(HL)`,
+direct-access port) into a paged window while the test code itself keeps
+running from block RAM. They never **fetch and execute instructions** out
+of SDRAM — which is exactly what a boot image must do. `sdramexec.asm`
+isolates that missing case.
+
+It is built to a flat `.BIN` and loaded into **block RAM** (the known-good
+path), then:
+
+1. Maps SDRAM physical page 4 (physical `0x010000`) into **frame 1**
+   (logical `0x4000..0x7FFF`) via `OUT (0xB1)` / `OUT (0xB5)`. Frame 1 is
+   used so the test's own code (frames 0–2) and stack/scratch (frame 0)
+   are undisturbed.
+2. Copies a tiny self-contained subroutine into `0x4000` with `LDIR`
+   (the proven data-write path).
+3. Reads the copy back byte-for-byte and verifies it (data-path sanity —
+   confirms the bytes really landed in SDRAM before trying to run them).
+4. `CALL 0x4000` to **fetch and execute the routine straight out of
+   SDRAM**, repeated `EXEC_RUNS` (16) times to catch intermittent /
+   non-deterministic fetch failures. The routine sums a 5-byte table and
+   adds a constant, returning a known value (`0xC3`); a correct return
+   proves real multi-instruction fetch (including a `DJNZ` loop branch)
+   from SDRAM, not a lucky single byte.
+
+Each stage prints PASS/FAIL on the serial console.
+
+**Position independence:** the Z-80 has no PC-relative `CALL`, so rather
+than relocating the routine's self-references, the routine has *none*: its
+only data (the sum table) lives at a **fixed block-RAM scratch address**
+(`srctn_tab`, filled at runtime) that is identical whether the code runs
+from block RAM or SDRAM. The copied body is just register ops, an
+immediate-loaded pointer to that fixed table, a `DJNZ` loop, and `RET` —
+all inherently relocatable.
+
+**Interpreting the result:**
+- *Copy+verify passes but EXECUTE fails (or is flaky)* → the fault is
+  specifically in the **SDRAM instruction-fetch / wait-state path** (the
+  `S_IDLE→S_REQ→S_DONE` SDRAM client FSM interacting with the Z-80 M1
+  opcode-fetch cycle and `wait_n`), which is the same path a boot image
+  depends on and the prime remaining suspect for the boot failure.
+- *Both copy+verify and EXECUTE pass* → SDRAM fetch is sound, pushing the
+  boot failure back toward the download write/handshake or the
+  `bin_loaded`/frame-0 switch-over.
+
+Build: `pasmo --bin testing/sdramexec.asm testing/sdramexec.bin` (≈1.8 KB
+flat binary, entry at `0x0000`).
+
+### Wait-line phase race: intermittent off-by-one on execute-from-SDRAM (OPEN)
+
+**Symptom (after the S_GAP deadlock fix below).** `sdramexec.bin` loaded into
+block RAM runs the routine out of SDRAM and *mostly* returns the correct
+`0xC3`, but **intermittently** one run in ~16 returns `0xC4` (one too high),
+e.g.:
+
+```
+EXECUTE from SDRAM: .....got=C4 ..........
+RESULT: SDRAM EXECUTION FAILED (fetch path)
+```
+
+`0xC4 = 0xC3 + 1`: the routine's table sum came out `0x100` instead of
+`0xFF` — i.e. exactly one instruction in the fetched-from-SDRAM routine
+mis-executed on that run. The failure is non-deterministic (different run
+each time), which points at a timing/CDC race rather than a logic error.
+
+**Hypothesis (unconfirmed).** The SDRAM client FSM and the MMU run on the
+fast 50 MHz `clk`, but the Z-80 (`t80s`) is clocked by `cpuClock` (a `clk/5`,
+~10 MHz *derived clock*, not a clock-enable). The combined `cpu_wait_n` is
+fed straight to the core, so the FSM can change it on the same `clk` edge
+that is also a `cpuClock` edge, leaving little setup margin.
+
+**ATTEMPTED FIX — REVERTED (regression).** A phase-aligned wait flop
+(`cpu_wait_n_sync`) that applied stalls immediately but deferred wait
+*releases* to the `cpuClock`-low phase was tried. On hardware it was a
+**regression**: the CPU appeared to reset when loading/running
+`sdramexec.bin`, and even the BASIC "ROM" no longer started. The change was
+rolled back in full (`MicrocomputerZ80CPM.vhd` restored to feeding
+`cpu_wait_n` directly to the core). **Do not re-apply that approach** without
+understanding why it broke normal operation — most likely it interfered with
+the MMU's own single-cycle `mmu_cpu_wait` handshake and/or the normal
+(non-SDRAM) cycle timing the whole machine depends on, effectively stalling
+or mis-timing every cycle, not just SDRAM ones.
+
+This off-by-one remains **OPEN**. Next investigation should:
+- Confirm the failing instruction with a targeted diagnostic (re-read the
+  SDRAM bytes on mismatch; dump A/PC) before changing RTL.
+- If it is the wait CDC, gate any phase-alignment to SDRAM cycles ONLY
+  (`phys_in_sdram`), never touching MMU/normal-cycle wait behaviour, and
+  prove it in simulation against a normal ROM/RAM cycle first.
+
+### SDRAM client FSM: back-to-back request deadlock (root cause of the execute-from-SDRAM hang)
+
+**Symptom.** With `sdramexec.bin` loaded into **block RAM** (frame 0 = block
+RAM, the known-good boot path), the test prints `EXECUTE from SDRAM: ` and
+then **hangs** — the `CALL 0x4000` into SDRAM never returns. No progress
+dots, no `got=` value, no `RESULT:` verdict. Yet the preceding copy and
+data-path **verify** of the very same SDRAM bytes pass.
+
+**Root cause — a clock-domain-crossing deadlock on tightly spaced requests.**
+The SDRAM request is handed from the 50 MHz `clk_sys` FSM to the 112 MHz
+`clk_ram` controller through a level handshake in `MultiComp.sv`
+(lines ~266-309): the request level `cpu_req_level = sdram_we_mux |
+sdram_rd_mux` is passed through a 2-FF synchroniser (`req_sync`) and a new
+transaction is launched **only on its rising edge** (`req_sync[1] &
+~req_seen`). For that rising edge to be detectable, the request level must
+first be observed **low** by the synchroniser between transactions.
+
+A data-only test (`sdramtest.asm`, which copies with `LDIR`) always supplies
+that low gap "for free": between any two SDRAM data accesses the CPU runs
+many **non-SDRAM** cycles (opcode fetches and the source byte read, all from
+block RAM), so `cpu_req_level` is low for a long time and the synchroniser
+always re-arms.
+
+**Instruction fetch from SDRAM removes the gap.** When code executes *out of*
+SDRAM, consecutive M1 opcode fetches are back-to-back SDRAM reads with only a
+short refresh phase between them. The old FSM dropped its strobe in `S_DONE`
+and immediately allowed the next request from `S_IDLE`, so two successive
+SDRAM accesses could merge into one **continuously-high** `cpu_req_level` as
+seen by the 112 MHz synchroniser — it never observes the intervening low,
+never detects a fresh rising edge, never launches the second transaction.
+The controller therefore never pulses `ready`, the FSM is stuck in `S_REQ`,
+`wait_n` stays low, and **the Z-80 hangs** mid-routine. This is exactly the
+"runs fine from block RAM, hangs the instant it is CALLed in SDRAM" symptom,
+and it is invisible to the data-only tests for the gap reason above.
+
+**The fix — an explicit inter-request dead-time state (`S_GAP`).** A fourth
+FSM state was added (`MicrocomputerZ80CPM.vhd`). After `S_DONE` (once the CPU
+drops its read/write strobe) the FSM enters `S_GAP`, holding `sdram_we`/`rd`
+**low** for a small counted number of `clk_sys` cycles (`sdram_gap_cnt`, 3
+cycles) before returning to `S_IDLE` to accept the next request. Because
+`clk_ram` (112 MHz) is ~2.24× `clk_sys` (50 MHz), 3 `clk_sys` cycles of
+enforced low guarantee ≥2 `clk_ram` edges sample the request level low, so
+the synchroniser re-arms and the next SDRAM access is always seen as a fresh
+rising edge. The dead time is incurred only between SDRAM transactions and
+does not affect non-SDRAM cycles.
+
+State graph is now `S_IDLE → S_REQ → S_DONE → S_GAP → S_IDLE`.
+
+### SDRAM client FSM hardened against the M1 opcode-fetch / refresh hazard
+
+Investigation of the SDRAM **instruction-fetch** path (the one execution and
+boot use but the data-only memory tests do not) also found a separate
+structural hazard in the SDRAM client FSM (`MicrocomputerZ80CPM.vhd`) around
+the Z-80 **M1 opcode fetch** (relevant specifically when frame 0 maps to
+SDRAM, i.e. a `.BIN` booted directly into SDRAM).
+
+**The hazard.** On an M1 fetch the T80 core asserts `MREQ` **twice** within
+one machine cycle:
+- **T2** — the data phase, with `RD` also asserted (the opcode read), and
+- **T3** — the *refresh* phase, with `RD`/`WR` deasserted and the refresh
+  address `I:R` driven on the bus (`Components/Z80/T80.vhd:411-415`,
+  `T80s.vhd:163-165`).
+
+With `I = 0` the refresh address `0x00:R` decodes to **frame 0**. When
+frame 0 maps to **SDRAM** (the boot-from-`.BIN` case, where frame 0 = SDRAM
+page 0), the refresh phase *also* decodes as SDRAM, so `mmu_req_mem_out`
+stays continuously high from the T2 data phase straight into the T3 refresh
+phase — there is **no clean `MREQ = 0` gap** between them. The old FSM keyed
+its `S_DONE → S_IDLE` exit on `mmu_req_mem_out = '0'`; because the CPU runs
+on the ~10 MHz `cpuClock` while the FSM samples at 50 MHz, whether the FSM
+caught the momentary `MREQ` deassert at the T2→T3 boundary was
+**clock-alignment dependent → non-deterministic**. This is exactly the
+"runs from block RAM, fails non-deterministically from SDRAM" signature, and
+it is invisible to `sdramtest.asm` (whose code runs from block RAM and only
+*data*-accesses SDRAM, so it never issues an M1 fetch to SDRAM).
+
+**The fix.** Key the FSM's `S_DONE` exit (and the `S_IDLE` re-arm) off the
+actual **read/write strobe** (`mmu_req_read` / `mmu_req_write`) instead of
+`MREQ`. Both strobes are deasserted in T3 (`RD_n = WR_n = 1`), so:
+- the `S_DONE → S_IDLE` boundary is the clean RD/WR falling edge, immune to
+  the T3 refresh `MREQ` pulse; and
+- a refresh cycle (MREQ high, RD/WR low) can never start a spurious SDRAM
+  access, even when frame 0 maps to SDRAM.
+
+The strobe-based exit is also inherently safe against re-triggering the same
+read inside a wait-stretched T2: while the CPU is still wait-stated, `RD`
+remains asserted, so the FSM stays in `S_DONE` until the CPU actually
+advances past T2 and drops `RD`. (A timing model across SDRAM-read latencies
+of 2–25 `clk` cycles confirmed the fix introduces no data mismatch, no
+spurious refresh-triggered request, and no same-cycle re-trigger.)
+
+**Note on the execution test vs. the real boot.** In `sdramexec.asm` the
+`.BIN` is loaded into **block RAM**, so frame 0 maps to block RAM and the M1
+**refresh** address decodes to block RAM (not SDRAM) while the executed code
+in frame 1 is fetched from SDRAM. That still exercises SDRAM M1 fetch (and
+the hardened exit), but it does **not** reproduce the worst case where the
+refresh address itself decodes to SDRAM. To stress that exact boot
+condition, either load the `.BIN` into SDRAM (frame 0 → SDRAM) or extend the
+execution test to map the SDRAM page into **frame 0** and run from there.
+
+### Legacy SRAM device removed (`MicrocomputerZ80CPM.vhd`)
+
+The dormant external-SRAM interface inherited from Grant Searle's original
+MultiComp has been deleted. It was never connected at the top level
+(`MultiComp.sv` left all `sram*` ports open) and its chip-select never
+fired in the MMU/SDRAM memory map. Removed:
+
+- Entity ports `sramData`, `sramAddress`, `n_sRamWE`, `n_sRamCS`,
+  `n_sRamOE`, `n_sRamLB`, `n_sRamUB`.
+- Signals `n_externalRamCS`, and the unused `internalRam2DataOut` /
+  `n_internalRam2CS`.
+- The `sramData when (n_externalRamCS = '0')` arm of the `cpuDataIn` bus
+  isolation mux.
+
+No `MultiComp.sv` change was needed (the ports were unconnected). This
+addresses outstanding-work item #7 (clean-up legacy memory device).
+
 #### Z2-compatible low-byte write (MMU.vhd)
 
 Writing a frame's low byte (ports +0..+3) now clears the entire mapping
@@ -931,7 +1244,10 @@ real-world misbehaviour:
    clean over 356+ soak passes and is the shipping configuration.
 7. **Clean-up legacy memory device** in `MicrocomputerZ80CPM.vhd` - 
    remove references to externalRam (`n_externalRamCS` and varous 
-   `internalRam2` related signals.
+   `internalRam2` related signals. **DONE** — the external-SRAM entity ports
+   (`sramData`, `sramAddress`, `n_sRam*`), `n_externalRamCS`, the unused
+   `internalRam2DataOut` / `n_internalRam2CS`, and the SRAM arm of the
+   `cpuDataIn` mux have been removed. See "Legacy SRAM device removed" above.
 8. **FORTH `NEXT` instruction (`ED 27`) hardware bring-up**: the T80
    microcode is implemented and GHDL-verified, but not yet tested on
    silicon. Confirm `HL = W`, `IP += 2`, and `PC := W` behave correctly,

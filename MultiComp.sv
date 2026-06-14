@@ -382,11 +382,12 @@ assign AUDIO_MIX = 0;
 `include "build_id.v"
 parameter CONF_STR = {
 	"MultiComp;;",
-	"S,IMG;",
-	"FC1,BINROM,Boot Rom Image;",                        // index 1: boot ROM image -> SDRAM @ 0x000000 (or block RAM if OD set)
-	"FC2,DSK,8MB Disk Image;",                        // index 2: RAM-disk image -> SDRAM, top 8 MB first
-	"OD,Boot Load Target,SDRAM,Block RAM;",           // status[13]: 0=BIN->SDRAM, 1=BIN->block RAM (debug)
+	"S,IMG,SD card image;",
 	"OF,Reset after Mount,No,Yes;", 
+	"-;",
+	"F1,BINROM,Boot Rom Image;",                     // index 1: boot ROM image -> SDRAM @ 0x000000 (or block RAM if OD set)
+	"F2,DSK,8MB Disk Image;",                        // index 2: RAM-disk image -> SDRAM, top 8 MB first
+	"OD,Boot Load Target,SDRAM,Block RAM;",          // status[13]: 0=BIN->SDRAM, 1=BIN->block RAM (debug)
 	"-;",
 	"O68,CPU-ROM,Z80-CP/M;",
 	"-;",
@@ -880,15 +881,37 @@ wire        dl_wr_edge = iowr_sync[1] & ~iowr_sync[2];
 // client's sdram_we_reg), so a single-cycle pulse is NOT sufficient.
 // ioctl_wait is asserted for the whole busy window so HPS pauses the
 // byte stream until each byte is committed.
+//
+// SDRAM-BOOT FIX (streamed-write recovery cooldown).
+// --------------------------------------------------
+// The sdram_32r8w controller asserts its write completion (sdram_cpu_ready,
+// from which sdram_ready_mux is derived) in STATE_RW1 -- at the moment the
+// WRITE command is issued -- and only THEN walks through STATE_DLY1/DLY2
+// back to STATE_IDLE. So "ready" is signalled before the write's
+// auto-precharge / write-recovery (tWR/tRP) has elapsed and before the
+// controller can accept another command. The Z-80 client never hit this
+// because each CPU write is paced by a full instruction; but the OSD
+// download streams bytes back-to-back, so dropping dl_we and immediately
+// re-raising it on the next byte could launch the next ACTIVE before the
+// previous write settled -- corrupting the loaded image (observed as the
+// non-deterministic boot-from-SDRAM failure, while the CPU-paced memory
+// test passed). Fix: after each write completes, hold dl_busy/ioctl_wait
+// for a short fixed cooldown so the controller fully drains to IDLE before
+// the next byte is launched. DL_WR_COOLDOWN clk_sys (50 MHz) cycles cover
+// many clk_ram (~100 MHz) controller cycles, comfortably spanning the
+// DLY1/DLY2 + recovery window with margin.
+localparam [3:0] DL_WR_COOLDOWN = 4'd8;
 reg         dl_we      = 1'b0;
 reg  [26:0] dl_addr_r  = 27'd0;
 reg  [7:0]  dl_din_r   = 8'h00;
 reg         dl_busy    = 1'b0;
+reg  [3:0]  dl_cool    = 4'd0;
 always @(posedge clk_sys) begin
 	if (!ioctl_download || dl_to_bram) begin
 		// Idle the SDRAM download FSM during block-RAM-targeted loads.
 		dl_we   <= 1'b0;
 		dl_busy <= 1'b0;
+		dl_cool <= 4'd0;
 	end else if (!dl_busy) begin
 		if (dl_wr_edge) begin
 			dl_addr_r <= dl_addr;
@@ -896,13 +919,21 @@ always @(posedge clk_sys) begin
 			dl_we     <= 1'b1;   // held until completion
 			dl_busy   <= 1'b1;
 		end
-	end else begin
+	end else if (dl_we) begin
 		// in-flight: hold the request level until the controller reports
-		// completion, then drop it so the adapter clears its edge-detect.
+		// completion, then drop it so the adapter clears its edge-detect
+		// and start the recovery cooldown (dl_busy stays high meanwhile).
 		if (sdram_ready_mux) begin
 			dl_we   <= 1'b0;
-			dl_busy <= 1'b0;
+			dl_cool <= DL_WR_COOLDOWN;
 		end
+	end else begin
+		// recovery cooldown: keep dl_busy/ioctl_wait asserted so HPS does
+		// not present the next byte until the controller has fully drained.
+		if (dl_cool != 4'd0)
+			dl_cool <= dl_cool - 1'b1;
+		else
+			dl_busy <= 1'b0;
 	end
 end
 

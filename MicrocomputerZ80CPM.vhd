@@ -24,14 +24,6 @@ entity MicrocomputerZ80CPM is
 		clk				: in std_logic;
 		baud_increment	: in std_logic_vector(15 downto 0);
 
-		sramData		: inout std_logic_vector(7 downto 0);
-		sramAddress		: out std_logic_vector(15 downto 0);
-		n_sRamWE		: out std_logic;
-		n_sRamCS		: out std_logic;
-		n_sRamOE		: out std_logic;
-		n_sRamLB		: out std_logic;
-		n_sRamUB		: out std_logic;
-		
 		rxd1			: in std_logic;
 		txd1			: out std_logic;
 		rts1			: out std_logic;
@@ -91,10 +83,12 @@ entity MicrocomputerZ80CPM is
 		bin_loaded		: in  std_logic := '0';
 
 		-- Debug aid: when high, the .BIN was loaded into the on-chip 64 KB
-		-- block RAM (which stays enabled) rather than SDRAM. Lets us
-		-- isolate whether unpredictable behaviour comes from the SDRAM path
-		-- or the load itself. When low (default), bin_loaded routes the low
-		-- 64 KB to SDRAM and disables block RAM as before.
+		-- block RAM rather than SDRAM. Lets us isolate whether unpredictable
+		-- behaviour comes from the SDRAM path or the load itself. In this
+		-- mode the MMU's frame 0 is kept pointing at the block RAM page (the
+		-- bin_loaded -> SDRAM-page-0 remap is suppressed), so the Z-80 boots
+		-- the image from 0x0000 out of block RAM. When low (default), a
+		-- loaded .BIN lives in SDRAM and frame 0 maps to SDRAM page 0.
 		boot_to_blockram	: in  std_logic := '0';
 
 		-- Block-RAM download write port (MiSTer ioctl side). Active only
@@ -121,7 +115,6 @@ architecture struct of MicrocomputerZ80CPM is
 
 	signal basRomData				: std_logic_vector(7 downto 0);
 	signal internalRam1DataOut		: std_logic_vector(7 downto 0);
-	signal internalRam2DataOut		: std_logic_vector(7 downto 0);
 	-- Block RAM port muxed between the CPU and the OSD download write path.
 	signal bram_address				: std_logic_vector(15 downto 0);
 	signal bram_data				: std_logic_vector(7 downto 0);
@@ -144,9 +137,7 @@ architecture struct of MicrocomputerZ80CPM is
 	signal n_int1					: std_logic :='1';	
 	signal n_int2					: std_logic :='1';	
 	
-	signal n_externalRamCS			: std_logic :='1';
 	signal n_internalRam1CS			: std_logic :='1';
-	signal n_internalRam2CS			: std_logic :='1';
 	signal n_basRomCS				: std_logic :='1';
 	signal n_interface1CS			: std_logic :='1';
 	signal n_interface2CS			: std_logic :='1';
@@ -156,12 +147,14 @@ architecture struct of MicrocomputerZ80CPM is
 	signal n_mmuCS					: std_logic :='1';   -- MMU 16-port window at 0xB0..0xBF
 
 	-- MMU plumbing. The MMU translates the Z-80's 16-bit logical address
-	-- into a 27-bit physical address (physical_page_bits = 13), covering
-	-- the full 128 MB of SDRAM (8192 pages x 16 KB). The same block
-	-- exposes the four mapping registers, a direct-access pointer, and a
-	-- direct-access data port, all through an external chip-select
-	-- (mmu_io_cs) tied to the 0xB0..0xBF window.
-	signal mmu_phys_addr			: std_logic_vector(26 downto 0);
+	-- into a 28-bit physical address (physical_page_bits = 14), covering a
+	-- 256 MB physical space (16384 pages x 16 KB). Physical pages 0..8191
+	-- are the 128 MB of SDRAM; physical page 8192 (physical 0x8000000) is
+	-- the relocated 64 KB on-chip block RAM, sitting just above the SDRAM.
+	-- The same block exposes the four mapping registers, a direct-access
+	-- pointer, and a direct-access data port, all through an external
+	-- chip-select (mmu_io_cs) tied to the 0xB0..0xBF window.
+	signal mmu_phys_addr			: std_logic_vector(27 downto 0);
 	signal mmu_dataOut				: std_logic_vector(7 downto 0);
 	signal mmu_io_cs				: std_logic;
 	signal mmu_req_mem_in			: std_logic;
@@ -172,22 +165,38 @@ architecture struct of MicrocomputerZ80CPM is
 	signal mmu_req_io_out			: std_logic;
 	signal mmu_cpu_wait				: std_logic;
 	signal mmu_reset				: std_logic;
+	-- bin_loaded as seen by the MMU reset map. The frame-0 -> SDRAM-page-0
+	-- remap is suppressed while booting a .BIN out of block RAM (debug
+	-- path), so frame 0 stays pointed at the block RAM page in that mode.
+	signal mmu_bin_loaded			: std_logic;
 
-	-- Physical-memory decode: the low 64 KB of physical address space
-	-- (phys_addr(21:16) = "000000") is covered by the on-chip block RAM.
-	-- Everything else routes to SDRAM.
+	-- Physical-memory decode. The block RAM has been relocated to physical
+	-- page 8192 (physical 0x8000000, the 64 KB window at phys_addr(27:16) =
+	-- "100000000000"), just above the 128 MB SDRAM. SDRAM occupies physical
+	-- 0x0000000..0x7FFFFFF (phys_addr(27) = '0'). The two regions are now
+	-- disjoint, so SDRAM is no longer shadowed and its full 128 MB is
+	-- addressable.
 	signal phys_in_blockram			: std_logic;
 	signal phys_in_sdram			: std_logic;
 
 	-- SDRAM client FSM. The CPU is stalled via wait_n until the SDRAM
 	-- controller pulses `ready`. Reads latch dout into sdramReadData
 	-- for the cpuDataIn mux.
-	type sdram_state_t is (S_IDLE, S_REQ, S_DONE);
+	type sdram_state_t is (S_IDLE, S_REQ, S_DONE, S_GAP);
 	signal sdram_state				: sdram_state_t := S_IDLE;
 	signal sdram_we_reg				: std_logic := '0';
 	signal sdram_rd_reg				: std_logic := '0';
 	signal sdramReadData			: std_logic_vector(7 downto 0) := (others => '0');
 	signal sdram_wait_n				: std_logic := '1';
+	-- Inter-request dead-time counter. After a transaction the request
+	-- strobe (sdram_we/rd) must stay low long enough for the request-level
+	-- 2-FF synchroniser in the 112 MHz clk_ram domain (MultiComp.sv) to
+	-- register the deassertion, otherwise a tightly-spaced following request
+	-- (e.g. consecutive M1 opcode fetches running out of SDRAM) is never
+	-- seen as a fresh rising edge and the controller deadlocks. clk_ram is
+	-- ~2.24x clk_sys, so 3 clk_sys cycles low guarantees >=2 clk_ram edges
+	-- see the strobe low. See S_GAP below.
+	signal sdram_gap_cnt			: unsigned(1 downto 0) := (others => '0');
 
 	-- Combined wait_n into the t80s core: AND of MMU's wait request and
 	-- the SDRAM FSM's stall.
@@ -283,9 +292,15 @@ mmu_req_io_in  <= not n_IORQ;
 mmu_req_read   <= not n_RD;
 mmu_req_write  <= not n_WR;
 mmu_reset      <= not N_RESET;
+mmu_bin_loaded <= bin_loaded and not boot_to_blockram;
 
+-- physical_page_bits => 14 gives a 28-bit / 256 MB physical address space
+-- (16384 pages x 16 KB). block_ram_page => 8192 places the relocated 64 KB
+-- block RAM at physical 0x8000000, just above the 128 MB SDRAM (pages
+-- 0..8191). bin_loaded steers the reset map of frame 0 (block RAM page by
+-- default, SDRAM page 0 when a .BIN boot image is loaded).
 mmu1 : entity work.MMU
-generic map(physical_page_bits => 13)
+generic map(physical_page_bits => 14, block_ram_page => 8192)
 port map(
 	clk            => clk,
 	reset          => mmu_reset,
@@ -300,23 +315,19 @@ port map(
 	req_io_out     => mmu_req_io_out,
 	io_cs          => mmu_io_cs,
 	req_read       => mmu_req_read,
-	req_write      => mmu_req_write
+	req_write      => mmu_req_write,
+	bin_loaded     => mmu_bin_loaded
 );
 
--- Physical-memory decode. Block RAM covers the low 64 KB of physical
--- memory (the first four 16 KB pages). Everything else is SDRAM.
--- All physical bits above bit 15 must be zero to hit block RAM, so high
--- SDRAM pages never alias into it.
--- When a .BIN boot image is loaded into SDRAM (boot_to_blockram = '0'),
--- the low 64 KB is served from SDRAM (where the BIN was written), so block
--- RAM is taken out of the physical map entirely and all accesses route to
--- SDRAM. When the BIN is instead loaded into block RAM (boot_to_blockram =
--- '1', debug mode), block RAM STAYS enabled and serves the low 64 KB as
--- normal -- only the ROM overlay is disabled (see n_basRomCS) so the BIN
--- runs from 0x0000 out of block RAM.
-phys_in_blockram <= '1' when mmu_phys_addr(26 downto 16) = "00000000000"
-                            and (bin_loaded = '0' or boot_to_blockram = '1') else '0';
-phys_in_sdram    <= not phys_in_blockram;
+-- Physical-memory decode. The block RAM has been relocated to physical
+-- page 8192 (physical 0x8000000): its 64 KB window is selected when
+-- phys_addr(27:16) = "100000000000". SDRAM occupies the low 128 MB,
+-- selected when phys_addr(27) = '0'. The regions are disjoint, so the
+-- choice of whether logical 0x0000 sees block RAM or SDRAM is made purely
+-- by the MMU's frame-0 mapping (driven by bin_loaded inside the MMU), not
+-- by force-enabling/disabling the block RAM here.
+phys_in_blockram <= '1' when mmu_phys_addr(27 downto 16) = "100000000000" else '0';
+phys_in_sdram    <= '1' when mmu_phys_addr(27) = '0' else '0';
 
 -- Combined wait_n into the CPU. cpu_wait_n = '0' stalls the Z-80.
 cpu_wait_n <= (not mmu_cpu_wait) and sdram_wait_n;
@@ -333,11 +344,12 @@ port map(
 -- ____________________________________________________________________________________
 -- RAM GOES HERE
 
--- Block RAM is now addressed by the MMU's physical output (low 16 bits).
--- It is the backing store for physical pages 0..3 (physical 0x000000..0x00FFFF).
--- Writes are qualified by both the memory-write strobe and the physical
--- decode (phys_in_blockram); the ROM overlay at logical 0x0000-0x1FFF
--- still wins on the cpuDataIn mux while n_RomActive = '0'.
+-- Block RAM is addressed by the MMU's physical output (low 16 bits). It is
+-- the backing store for the relocated block RAM page 8192..8195 (physical
+-- 0x8000000..0x800FFFF). Writes are qualified by both the memory-write
+-- strobe and the physical decode (phys_in_blockram); the ROM overlay at
+-- logical 0x0000-0x1FFF still wins on the cpuDataIn mux while
+-- n_RomActive = '0'.
 -- During a block-RAM-targeted .BIN download the CPU is in reset, so the
 -- download write port drives the block RAM's address/data/wren. Otherwise
 -- the CPU's MMU-translated physical address and write strobe are used.
@@ -563,7 +575,6 @@ n_internalRam1CS <= '0' when phys_in_blockram = '1' else '1';
                  basRomData          when (n_basRomCS = '0') else
                  internalRam1DataOut when (phys_in_blockram = '1') else
                  sdramReadData       when (phys_in_sdram = '1') else
-                 sramData            when (n_externalRamCS = '0') else
                  x"FF";
 
 -- ____________________________________________________________________________________
@@ -581,9 +592,37 @@ n_internalRam1CS <= '0' when phys_in_blockram = '1' else '1';
 --           controller pulses sdram_ready, latch sdramReadData (for
 --           reads) and move to S_DONE.
 --   S_DONE: deassert sdram_we/rd, release wait_n, hold one cycle so the
---           Z-80 captures the read data on the next clock edge. Return
---           to S_IDLE once the CPU drops MREQ/IORQ.
-sdram_addr <= mmu_phys_addr;  -- 27-bit physical address spans all 128 MB
+--           Z-80 captures the read data on the next clock edge. Once the
+--           CPU drops its READ/WRITE strobe, move to S_GAP.
+--   S_GAP : inter-request dead time. Hold the request strobes low for a
+--           few clk_sys cycles so the 112 MHz request-level synchroniser
+--           in MultiComp.sv registers the deassertion and will see the
+--           NEXT request as a fresh rising edge. Without this, tightly
+--           spaced SDRAM accesses (consecutive M1 opcode fetches running
+--           out of SDRAM) merge into one held request level, the
+--           controller never re-triggers, wait_n sticks low and the CPU
+--           hangs. This is why a routine runs fine from block RAM but
+--           hangs the instant it executes from SDRAM, while data-only
+--           tests (LDIR) pass (their non-SDRAM cycles supply the gap).
+--
+-- M1 / REFRESH HAZARD (why the exit keys off RD/WR, not MREQ):
+--   On a Z-80 M1 opcode fetch the T80 core asserts MREQ in BOTH T2 (the
+--   data phase, with RD also asserted) AND T3 (the refresh phase, with RD
+--   deasserted and the refresh address I:R on the bus). When frame 0 maps
+--   to SDRAM (the boot-from-.BIN case) that refresh address ALSO decodes as
+--   SDRAM, so mmu_req_mem_out stays high continuously from the data phase
+--   into the refresh phase -- there is no clean MREQ=0 gap between them at
+--   the 50 MHz FSM sampling rate (the CPU runs on the ~10 MHz cpuClock, so
+--   whether the FSM catches the momentary MREQ deassert is alignment-
+--   dependent -> non-deterministic). Keying the S_DONE exit and re-arm off
+--   the actual read/write strobe (mmu_req_read / mmu_req_write), which is
+--   deasserted in T3 (RD_n=1, WR_n=1), gives a deterministic boundary that
+--   the T3 refresh MREQ cannot blur. This is the path instruction fetch
+--   from SDRAM depends on, so it was invisible to data-only memory tests.
+-- SDRAM access only occurs when phys_in_sdram = '1', i.e. mmu_phys_addr(27)
+-- = '0', so the low 27 bits fully cover the SDRAM access. The block RAM
+-- page (bit 27 set) never reaches the SDRAM controller.
+sdram_addr <= mmu_phys_addr(26 downto 0);  -- 27-bit address spans all 128 MB of SDRAM
 sdram_din  <= cpuDataOut;
 sdram_we   <= sdram_we_reg;
 sdram_rd   <= sdram_rd_reg;
@@ -597,14 +636,21 @@ begin
 			sdram_rd_reg  <= '0';
 			sdram_wait_n  <= '1';
 			sdramReadData <= (others => '0');
+			sdram_gap_cnt <= (others => '0');
 		else
 			case sdram_state is
 				when S_IDLE =>
 					sdram_we_reg <= '0';
 					sdram_rd_reg <= '0';
 					sdram_wait_n <= '1';
-					-- Kick off a request when MMU has promoted the
-					-- cycle to a physical memory access targeting SDRAM.
+					-- Kick off a request when the MMU has promoted the cycle
+					-- to a physical memory access targeting SDRAM. The trigger
+					-- keys off the actual READ/WRITE strobe AND req_mem_out so
+					-- it is immune to the M1 T3 refresh MREQ pulse (which
+					-- asserts req_mem_out with both RD_n and WR_n high, i.e.
+					-- mmu_req_read = mmu_req_write = '0'); a refresh therefore
+					-- never starts a spurious SDRAM cycle even when frame 0
+					-- maps to SDRAM. See "M1 / REFRESH HAZARD" above.
 					if mmu_req_mem_out = '1' and phys_in_sdram = '1' then
 						if mmu_req_write = '1' then
 							sdram_we_reg <= '1';
@@ -637,11 +683,43 @@ begin
 				when S_DONE =>
 					-- sdramReadData is now stable. Release the CPU wait so
 					-- the Z-80 captures the correct read byte, then wait for
-					-- it to drop MREQ before accepting a new request (this
-					-- keeps the FSM from re-triggering on the same bus cycle).
+					-- it to drop its READ/WRITE strobe before accepting a new
+					-- request (this keeps the FSM from re-triggering on the
+					-- same bus cycle). The strobe-based exit (rather than
+					-- MREQ) is immune to the M1 T3 refresh MREQ pulse, which
+					-- otherwise keeps mmu_req_mem_out high across the data->
+					-- refresh boundary and makes the exit alignment-dependent
+					-- (see "M1 / REFRESH HAZARD" above).
 					sdram_wait_n <= '1';
-					if mmu_req_mem_out = '0' then
+					if mmu_req_read = '0' and mmu_req_write = '0' then
+						-- Enforce the inter-request dead time before another
+						-- transaction may start. sdram_we/rd are already low
+						-- here; hold them low through S_GAP so the 112 MHz
+						-- request-level synchroniser in MultiComp.sv sees a
+						-- clean falling edge and will detect the NEXT request
+						-- as a fresh rising edge. Without this, back-to-back
+						-- SDRAM accesses (e.g. consecutive M1 opcode fetches
+						-- executing from SDRAM) can merge into one held level,
+						-- the controller never re-triggers, wait_n sticks low
+						-- and the CPU hangs -- exactly the symptom where code
+						-- runs from block RAM but hangs the instant it is
+						-- CALLed in SDRAM. Data-only tests (LDIR) never hit it
+						-- because non-SDRAM cycles supply the gap for free.
+						sdram_gap_cnt <= "10";        -- 3 clk_sys cycles of dead time
+						sdram_state   <= S_GAP;
+					end if;
+
+				when S_GAP =>
+					-- Strobes held low; just count down the dead time. Re-arm
+					-- only after the request level has been low long enough
+					-- for the clk_ram 2-FF synchroniser (>= 2 clk_ram edges).
+					sdram_we_reg <= '0';
+					sdram_rd_reg <= '0';
+					sdram_wait_n <= '1';
+					if sdram_gap_cnt = 0 then
 						sdram_state <= S_IDLE;
+					else
+						sdram_gap_cnt <= sdram_gap_cnt - 1;
 					end if;
 			end case;
 		end if;

@@ -90,6 +90,19 @@
 -- A forced CPU wait state is inserted when port +12 is accessed so the
 -- synchronous memory has a cycle to read the new address off the bus.
 --
+-- RESET MAPPING / BLOCK-RAM RELOCATION
+-- ------------------------------------
+-- The on-chip block RAM is no longer placed at physical page 0 (it used to
+-- shadow the bottom of the physical address space). It is relocated to its
+-- own physical page given by the generic block_ram_page, above the SDRAM
+-- region, so the full SDRAM is contiguously addressable with no shadowing.
+-- At reset the map points logical frame 0 at block_ram_page (so the Z-80
+-- boots from block RAM at logical 0x0000) and frames 1..3 at SDRAM physical
+-- pages 1..3. The bin_loaded input overrides frame 0 to SDRAM physical page
+-- 0 when a .BIN boot image has been loaded into SDRAM, so it boots from
+-- 0x0000 instead. This default-mapping mechanism replaces the former
+-- external "force block RAM on/off" control signals.
+--
 
 library IEEE;
 use IEEE.std_logic_1164.all;
@@ -101,7 +114,16 @@ entity MMU is
         -- 4 MB physical address space; larger values widen the physical
         -- address bus and enable the extension I/O ports at offsets +4..+7.
         -- Legal range: 8..32.
-        physical_page_bits : integer := 8
+        physical_page_bits : integer := 8;
+
+        -- Physical page number of the relocated on-chip block RAM. The
+        -- block RAM no longer shadows the bottom of the physical address
+        -- space; it is placed at its own page above the SDRAM region. With
+        -- physical_page_bits = 14 (256 MB / 16384 pages) and the block RAM
+        -- relocated to physical 0x8000000 (just above the 128 MB SDRAM),
+        -- this is page 8192. The reset map points frame 0 here so the Z-80
+        -- boots from block RAM at logical 0x0000.
+        block_ram_page     : integer := 8192
     );
     port(
         clk             : in  std_logic;
@@ -117,7 +139,17 @@ entity MMU is
         req_io_out      : out std_logic;
         io_cs           : in  std_logic;
         req_read        : in  std_logic;
-        req_write       : in  std_logic
+        req_write       : in  std_logic;
+        -- Boot-source select for the reset mapping. When low (default), the
+        -- reset map points logical frame 0 at the relocated on-chip block
+        -- RAM page (block_ram_page) so the Z-80 fetches its first
+        -- instructions from block RAM at logical 0x0000. When high (a .BIN
+        -- boot image has been loaded into SDRAM), the reset map points frame
+        -- 0 at SDRAM physical page 0 instead, so the loaded image boots from
+        -- 0x0000. This replaces the former external "force block RAM on/off"
+        -- control signals: the boot source is now chosen purely by the
+        -- default MMU mapping.
+        bin_loaded      : in  std_logic := '0'
     );
 end MMU;
 
@@ -244,16 +276,27 @@ begin
     begin
         if rising_edge(clk) then
             if reset = '1' then
-                -- Placeholder identity map: frame K -> physical page K.
-                -- TODO: revisit when the physical memory layout (ROM region,
-                -- SDRAM region) is fixed during system integration.
-                for k in 0 to 3 loop
-                    mmu_frame(k) <= (others => '0');
-                end loop;
-                mmu_frame(0)(1 downto 0) <= "00";  -- physical page 0
-                mmu_frame(1)(1 downto 0) <= "01";  -- physical page 1
-                mmu_frame(2)(1 downto 0) <= "10";  -- physical page 2
-                mmu_frame(3)(1 downto 0) <= "11";  -- physical page 3
+                -- Reset mapping. The on-chip block RAM has been relocated to
+                -- its own physical page (block_ram_page) above the SDRAM
+                -- region; it no longer shadows physical page 0. To keep the
+                -- Z-80 booting from 0x0000 the default map points logical
+                -- frame 0 at the block RAM page, and frames 1..3 at SDRAM
+                -- physical pages 1..3 (so logical 0x4000..0xFFFF is SDRAM low
+                -- memory).
+                --
+                -- When bin_loaded = '1' a .BIN boot image has been written
+                -- into SDRAM at physical 0x0000, so frame 0 instead maps to
+                -- SDRAM physical page 0 and the image boots from 0x0000. This
+                -- replaces the former external block-RAM enable/disable
+                -- control signals.
+                if bin_loaded = '1' then
+                    mmu_frame(0) <= (others => '0');               -- SDRAM page 0
+                else
+                    mmu_frame(0) <= std_logic_vector(to_unsigned(block_ram_page, physical_page_bits));
+                end if;
+                mmu_frame(1) <= std_logic_vector(to_unsigned(1, physical_page_bits));  -- SDRAM page 1
+                mmu_frame(2) <= std_logic_vector(to_unsigned(2, physical_page_bits));  -- SDRAM page 2
+                mmu_frame(3) <= std_logic_vector(to_unsigned(3, physical_page_bits));  -- SDRAM page 3
                 direct_access_pointer <= (others => '0');
                 was_map_io_to_direct  <= '0';
             else
