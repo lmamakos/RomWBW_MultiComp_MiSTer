@@ -1,0 +1,32 @@
+	.z80  db 0,1,2,3
+
+
+DOCODE  EQU 0      ; flag to indicate CODE words
+link    DEFL 0     ; link to previous Forth word
+
+
+head    MACRO  label,length,name,action
+; ---------
+        DW link
+        DB 0
+link    DEFL $
+        DB length,"name"
+label:
+        IFF (action EQ DOCODE)
+        call action
+        ENDIF
+; ---------
+        ENDM
+
+
+
+;    head COMMADEST,5,!,DEST,DOCODE
+;    head COMMADEST,5,DEST,DOCODE
+    head COMMADEST,5,DEST,DOCODE
+        jp COMMA
+
+
+docodefoo:
+comma:
+store:
+	end
