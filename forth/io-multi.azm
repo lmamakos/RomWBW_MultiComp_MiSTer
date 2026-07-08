@@ -78,25 +78,10 @@ key1:   IN A,(C)
 ;	NEXT
 	DB 0EDH,27H	; custom instruction
 	
-;X 2!  ( d a -- )
-   head TWOSTORE,2,'2!',docode
-	POP HL		; address pointer
-	INC HL ; a+1
-	INC HL ; a+2
-	LD (HL),C	; store high order word at higher address
-	INC HL ; a+3
-	LD (HL),B
-	DEC HL : a+2
-	DEC HL : a+1
-	POP BC		; get low word
-	LD (HL),B
-	DEC HL : a
-	LD (HL),C
-	POP BC		; pop low word
-	NEXT
-
-;X 2@  ( a -- d )
-   head TWOLOAD,2,'2@',docode
+; NOTE: 2! and 2@ are already defined (as TWOSTORE/TWOFETCH) in
+; camel80h.azm.  The duplicate definitions that used to live here were
+; both broken (multiply-defined symbol, and ';'-comments miswritten as
+; ':') and have been removed to let the module assemble.
 
 ; ------------------------------------------------------------------
 ; ------------------------------------------------------------------
@@ -186,32 +171,42 @@ introdump:
 RAMDISK EQU 1
 
  IFDEF RAMDISK
-;  I/O words to access the preloaded "RAM Disk" that is preloaded at
-;  the end of the 128 MB SDRAM, in the last 8MB of address space.  This
-;  was intended to preload a RAM disk for RomWBW, but we can take
-;  advantage of it here to pass in plenty of FORTH blocks just lying
-;  around in memory.
+;  I/O words to access the preloaded "RAM Disk" that lives in the top
+;  8 MB of the 128 MB SDRAM.  This was intended to preload a RAM disk
+;  image for RomWBW, but we can take advantage of it here to pass in
+;  plenty of FORTH blocks just lying around in memory.
+;
+;  The preloaded "disk image" starts at physical byte address
+;  0x07800000 (page 7680 x 16 KB).  This matches the download path in
+;  MultiComp.sv: dl_dsk_base = SDRAM_TOP - (slot+1)*8MB, so the first
+;  RAM disk (slot 0) lands in the top 8 MB.  See IOPORTS.md.
+;
+;  The physical base is defined below as two 16-bit halves because the
+;  M80-compatible assembler evaluates expressions as 16-bit and cannot
+;  hold a full 32-bit constant.  To relocate the RAM disk, change these
+;  two EQUs (and, if needed, the download base in MultiComp.sv).
 
+RDBASELO EQU 0000h	; RAM-disk physical base, low  16 bits (0x07800000)
+RDBASEHI EQU 0780h	; RAM-disk physical base, high 16 bits
+B$BLK    EQU 1024	; FORTH block size in bytes (16 lines x 64 cols)
 
-;  The preloaded RAM starts at 
-; The SD card FPGA component does 512 byte transfers to a linear
-; array of sectors. 
-
-;  The starting physical address of the "disk image" is
-;  0x03800000
-
-; Direct access pointer ports:
-;   0xB8     Direct access pointer, bits  7:0
-;   0xB9     Direct access pointer, bits 15:8
-;   0xBA     Direct access pointer, bits 23:16
-;   0xBB     Direct access pointer, bits 31:24
-;   0xBC     Direct access data port (R/W triggers a physical memory access at
-;             the pointer; pointer post-increments after the access)
+; MMU direct-access I/O ports (16-port window based at 0xB0):
+;   0xB8     Direct access pointer, bits  7:0   (+8, little-endian, low first)
+;   0xB9     Direct access pointer, bits 15:8   (+9)
+;   0xBA     Direct access pointer, bits 23:16  (+10)
+;   0xBB     Direct access pointer, bits 31:24  (+11)
+;   0xBC     Direct access data port (+12).  Each R/W triggers a physical
+;            memory access at the pointer; the pointer post-increments
+;            after the access, so INIR/OTIR walk forward through memory.
+MMUP0    EQU 0B8h	; direct-access pointer, byte 0
+MMUDAT   EQU 0BCh	; direct-access data port (post-increment)
 
 addressbase:
-     dw 0000h,0380h	; 32 bit (doubleint) address, LE
+     dw RDBASELO,RDBASEHI	; 32-bit (doubleint) base address, LE
 addressptr:
-     dw 0000h,0380h	; 32 bit (doubleint) address, LE
+     dw RDBASELO,RDBASEHI	; 32-bit working pointer, LE
+
+; --- FORTH introspection: expose the RAM-disk geometry / MMU ports ---
 
   head mmuaddrbase,11,'mmuaddrbase',docon
      dw addressbase
@@ -219,60 +214,230 @@ addressptr:
   head mmuaddrptr,10,'mmuaddrptr',docon
      dw addressptr
 
+; RD-BASE ( -- a )  address of the 32-bit RAM-disk base; use  RD-BASE 2@
+  head rd$base,7,'RD-BASE',docon
+     dw addressbase
 
-; seek-file  ( block-num -- )
-  head file$seek,9,'seek-file',docolon
-;    dw LIT,3, LSHIFT    ; multiply block number by 8 for CPM rec#
-;    dw FCB$, LIT,33, PLUS, STORE       ; store CP/M rec into FCB random rec#
-;    dw LIT,0, LIT,35, fcb$, PLUS, CSTORE     ; zero record extension
+; B/BLK ( -- n )  FORTH block size in bytes
+  head slashblk,5,'B/BLK',docon
+     dw B$BLK
 
-    dw DROP, LIT,-1
-    dw EXIT
+; MMU-PTR ( -- port )  MMU direct-access pointer base port (0xB8)
+  head mmuptrport,7,'MMU-PTR',docon
+     dw MMUP0
 
-; read-file
+; MMU-DAT ( -- port )  MMU direct-access data port (0xBC)
+  head mmudatport,7,'MMU-DAT',docon
+     dw MMUDAT
+
+; RD>MEM ( phys-lo phys-hi c-addr count -- )
+;   Copy 'count' bytes from RAM-disk physical address (phys-hi:phys-lo)
+;   into Z-80 logical memory at c-addr, using the MMU direct-access
+;   window.  The four pointer bytes are written low-first, then the data
+;   is streamed through the auto-incrementing data port with INIR (each
+;   INIR moves up to 256 bytes; we loop for larger counts).
+  head rdtomem,6,'RD>MEM',docode
+	; Register/stack model on entry (Forth TOS is in BC):
+	;   BC          = count
+	;   (sp)+0      = c-addr   (destination, popped first)
+	;   (sp)+2      = phys-hi
+	;   (sp)+4      = phys-lo
+	; We must consume all four cells and refill BC with the new TOS.
+	ld h,b
+	ld l,c			; hl = count
+	pop de			; de = c-addr (destination)
+	pop bc			; bc = phys-hi
+	ex (sp),hl		; (sp) <- count ; hl <- phys-lo
+	; now: hl = phys-lo, bc = phys-hi, de = dest, (sp) = count
+	push bc			; save phys-hi
+	ld c,MMUP0
+	out (c),l		; +0  bits  7:0
+	inc c
+	out (c),h		; +1  bits 15:8
+	pop hl			; hl = phys-hi
+	inc c
+	out (c),l		; +2  bits 23:16
+	inc c
+	out (c),h		; +3  bits 31:24
+	pop hl			; hl = count (restored)
+	ex de,hl		; de = count, hl = dest pointer
+	; stream 'de' bytes from MMUDAT into (hl); 256-byte chunks via INIR
+	ld c,MMUDAT
+rdmem1:	ld a,d			; whole 256-byte chunks remaining?
+	or a
+	jr z,rdmem2		; none: do the final partial chunk
+	ld b,0			; b=0 => INIR transfers 256 bytes
+	inir
+	dec d
+	jr rdmem1
+rdmem2:	ld a,e			; low byte = remaining bytes (0..255)
+	or a
+	jr z,rdmem3
+	ld b,e
+	inir
+rdmem3:	pop bc			; refill Forth TOS with the new top cell
+	next
+
+; MEM>RD ( phys-lo phys-hi c-addr count -- )
+;   The write counterpart of RD>MEM: copy 'count' bytes from Z-80 logical
+;   memory at c-addr OUT to the RAM-disk physical address (phys-hi:phys-lo),
+;   using the MMU direct-access window.  Same pointer set-up as RD>MEM, then
+;   the data is streamed to the auto-incrementing data port with OTIR.
+  head memtord,6,'MEM>RD',docode
+	; identical stack model to RD>MEM (TOS in BC = count):
+	;   (sp)+0 = c-addr (source)   (sp)+2 = phys-hi   (sp)+4 = phys-lo
+	ld h,b
+	ld l,c			; hl = count
+	pop de			; de = c-addr (source)
+	pop bc			; bc = phys-hi
+	ex (sp),hl		; (sp) <- count ; hl <- phys-lo
+	push bc			; save phys-hi
+	ld c,MMUP0
+	out (c),l		; +0  bits  7:0
+	inc c
+	out (c),h		; +1  bits 15:8
+	pop hl			; hl = phys-hi
+	inc c
+	out (c),l		; +2  bits 23:16
+	inc c
+	out (c),h		; +3  bits 31:24
+	pop hl			; hl = count (restored)
+	ex de,hl		; de = count, hl = source pointer
+	; stream 'de' bytes from (hl) to MMUDAT; 256-byte chunks via OTIR
+	ld c,MMUDAT
+wrmem1:	ld a,d			; whole 256-byte chunks remaining?
+	or a
+	jr z,wrmem2		; none: do the final partial chunk
+	ld b,0			; b=0 => OTIR transfers 256 bytes
+	otir
+	dec d
+	jr wrmem1
+wrmem2:	ld a,e			; low byte = remaining bytes (0..255)
+	or a
+	jr z,wrmem3
+	ld b,e
+	otir
+wrmem3:	pop bc			; refill Forth TOS with the new top cell
+	next
+
+; >PHYS ( blk# -- phys-lo phys-hi )
+;   Compute the RAM-disk physical address of FORTH block 'blk#':
+;       base + blk# * 1024
+;   Returns the 32-bit result as two cells (low then high) so it can be
+;   fed straight into RD>MEM.  32-bit math done here in assembly because
+;   the kernel has no D+ .
+  head tophys,5,'>PHYS',docode
+	; BC = blk#.  Compute blk#*1024 into DE:HL (hi:lo).
+	ld h,b
+	ld l,c			; hl = blk#
+	ld de,0			; de = high word accumulator
+	; multiply by 1024 = shift left 10 bits, propagating into DE
+	ld a,10
+phys1:	add hl,hl		; hl <<= 1
+	ex de,hl
+	adc hl,hl		; de <<= 1 with carry in from hl
+	ex de,hl
+	dec a
+	jr nz,phys1
+	; add the 32-bit base (RDBASEHI:RDBASELO)
+	ld bc,RDBASELO
+	add hl,bc		; low word + base low
+	ex de,hl
+	ld bc,RDBASEHI
+	adc hl,bc		; high word + base high + carry
+	ex de,hl
+	; hl = phys-lo, de = phys-hi.  Push phys-lo, leave phys-hi in TOS.
+	push hl			; phys-lo -> stack
+	ld b,d
+	ld c,e			; TOS = phys-hi
+	next
+
+; -------------------------------------------------------------------
+; Block-file interface compatible with the CP/M version in io-cpm.azm,
+; so the portable block-buffer / editor code in blocks/*-blocks.fth,
+; blocks/*-editor.fth, etc. runs unchanged.  Instead of a CP/M file,
+; the "file" is the RAM disk: block N occupies RAM-disk bytes
+; N*1024 .. N*1024+1023 (see >PHYS).  FCB$ is a dummy, non-zero handle
+; the block layer stashes in BHNDL to mean "open".
+; -------------------------------------------------------------------
+
+fcb$buf:  DS 2		; dummy handle storage (contents unused)
+
+; FCB$ ( -- a )   opaque, non-zero file handle used by the block layer
+  head fcb$,4,'FCB$',docon
+     dw fcb$buf
+
+; open-file ( -- )   no-op for the RAM disk; the block layer immediately
+;   does  open-file FCB$ BHNDL !  so the handle comes from FCB$, and this
+;   word only has to leave the stack unchanged and "succeed".
+  head open$file,9,'open-file',docolon
+     DW EXIT
+
+; read-file  ( block# buffer-adr -- )
+;   Read one 1024-byte block from the RAM disk into buffer-adr.  Called
+;   this way by RBLK:  SWAP DUP >R read-file R>  (buffer preserved there).
   head read$file,9,'read-file',docolon
-;    dw LIT,33, ROT, ROT, file$io
-;    dw DROP  ; ignore status
+     DW SWOP			; ( buf block# )
+     DW tophys			; ( buf phys-lo phys-hi )
+     DW ROT			; ( phys-lo phys-hi buf )
+     DW lit,B$BLK		; ( phys-lo phys-hi buf count )
+     DW rdtomem
+     DW EXIT
 
-    dw DROP
-    dw EXIT
-
-; write-file
+; write-file ( block# buffer-adr -- )
+;   Write one 1024-byte block from buffer-adr out to the RAM disk.
+;   Called by WBLK:  SWAP write-file .
   head write$file,10,'write-file',docolon
-;    dw LIT,40, ROT, ROT, file$io
-;    dw DROP  ; ignore status    
-
-    dw EXIT
-
+     DW SWOP			; ( buf block# )
+     DW tophys			; ( buf phys-lo phys-hi )
+     DW ROT			; ( phys-lo phys-hi buf )
+     DW lit,B$BLK		; ( phys-lo phys-hi buf count )
+     DW memtord
+     DW EXIT
 
 ; I know this is ugly, for now
 disk$buf    EQU 8000h
 
-; load - load and evaluate a block from the (open)
-;        block file.   Pretty bare-bones and expected
-;        to be replaced by a more sophisticated version
-;        from the FORTH environment extended after loading
+; LOAD ( blk# -- )   load and interpret one 1024-byte FORTH block from
+;                    the RAM disk.
 ;
-;     HEX
-;     : LOAD (blocknum -- ) open-file 8000 read-file
-;       10 0 DO 8000 I 40 * + 40 2DUP CR BASE @ DECIMAL I . BASE ! 3E EMIT
-;       SPACE TYPE EVALUATE LOOP ;
+; Two interpretation strategies, selected at assembly time:
+;
+;   LOADLINES undefined (default):
+;       Whole-block mode.  The entire 1024-byte block is handed to
+;       EVALUATE in one call, so a single colon definition may span
+;       several of the 64-column lines within the block.
+;
+;   LOADLINES defined (e.g.  um80 -D LOADLINES ...  or uncomment below):
+;       Classic per-line "screen" mode.  Each of the 16 lines is echoed
+;       with its line number and EVALUATEd on its own.  A definition
+;       must then fit entirely on one 64-column line.
+;
+; LOADLINES EQU 1	; <- uncomment for classic per-line screen behaviour
+;
   head load$extend,4,'LOAD',docolon
-;    DW open$file
-;    DW LIT,disk$buf, read$file
-;    DW LIT,10h, LIT,0, XDO
+	; pull the block into disk$buf via the MMU direct-access window
+	DW tophys			; ( blk# -- phys-lo phys-hi )
+	DW lit,disk$buf, lit,B$BLK
+	DW rdtomem			; ( phys-lo phys-hi c-addr count -- )
+  IFDEF LOADLINES
+	; --- classic per-line screen interpretation ---
+	DW lit,10h, lit,0, xdo		; 16 lines
 LOAD1:
-;    DW LIT,disk$buf, II
-;    DW LIT,40h, STAR, PLUS
-;    DW LIT,40h, TWODUP, CR
-;    DW BASE, FETCH, DECIMAL, II, DOT, BASE, STORE
-;    DW LIT,3Eh, EMIT
-;    DW SPACE, TYPE, EVALUATE
-;    DW XLOOP,LOAD1
-
-    DW DROP
-
-    DW EXIT
+	DW lit,disk$buf, II, lit,40h, STAR, PLUS  ; addr of this 64-col line
+	DW lit,40h			; length = 64
+	DW TWODUP, CR			; ( addr len addr len ) show it below
+	DW BASE, FETCH, DECIMAL, II, DOT, BASE, STORE  ; echo line number
+	DW lit,3Eh, EMIT		; '>' prompt
+	DW SPACE, TYPE			; print the line text
+	DW EVALUATE			; interpret this line
+	DW xloop, LOAD1
+  ELSE
+	; --- whole-block interpretation (definitions may span lines) ---
+	DW lit,disk$buf, lit,B$BLK
+	DW EVALUATE
+  ENDIF
+	DW EXIT
 
  ELSE
 

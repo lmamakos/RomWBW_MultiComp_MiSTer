@@ -34,14 +34,21 @@ Initial default mapping has:
 | 3 (C000-FFFF)   |      3       | 0x00  | 0x03  |
 
 
-So the SDRAM Disk Image is at
-      3   |     8     |    0      |    0      |    0      |    0      |    0     |  
-  1  1  1  1  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0     
+So the SDRAM Disk Image is at page 7680 (0x1E00), i.e. page# 7680 x 16K
+(0x4000) = physical byte address 0x07800000:
+
+      7   |     8     |    0      |    0      |    0      |    0      |    0     |
+  0  1  1  1  1  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0
   26 25 24.23 22 21 20.19 18 17 16.15 14 13 12.11 10 09 08.07 06 05 04.03 02 01 00
   \--high pg#--/ \-- low order page #--/ \--- In-page low order address bits ----/
        1E                  0
 
-Start phys addr 0x3800000   0x03 80 00 00
+Start phys addr 0x7800000   0x07 80 00 00
+
+This matches the download path in `MultiComp.sv`:
+`dl_dsk_base = SDRAM_TOP - (slot+1)*8MB` with `SDRAM_TOP = 0x8000000` and
+`DSK_IMAGE_SIZE = 0x0800000`, so the first RAM disk (slot 0) lands in the
+top 8 MB at `0x7800000`.
 
 ## I/O port map (reference)
 
