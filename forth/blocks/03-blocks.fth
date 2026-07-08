@@ -1,0 +1,16 @@
+( 03-blocks ) HEX
+: BUFFER ( n -- addr ) USE @ DUP >R @  0< IF R@ CELL+  R@ @ 
+    MASK WBLK THEN  R@ !  R@ PREV !  R@ +BUF USE !  R> CELL+ ;
+: BLOCK  ( block# --- addr ) ?BLOCKS >R PREV @ DUP @  R@ - MASK
+  IF BEGIN +BUF DUP PREV @ = IF DROP R@ BUFFER  R@ RBLK 2 - THEN
+  DUP @ R@ -  MASK WHILE REPEAT DUP PREV ! DUP USE @ = IF
+  DUP +BUF USE ! THEN THEN R> DROP CELL+ ;
+: FLUSH ( -- ) ?BLOCKS FIRST #BUFF 0 DO DUP @ 0<  IF
+   DUP @ MASK  OVER 2DUP ! CELL+ SWAP WBLK THEN +BUF LOOP DROP ;
+: EMPTY-BUFFERS ( -- ) FIRST LIMIT OVER - 0 FILL 
+   #BUFF 0 DO  7FFF B/REC I * FIRST + ! LOOP ;
+: OPEN-BLOCKS 2DROP BHNDL @ 0= IF ( don't re-open/init if open )
+      EMPTY-BUFFERS open-file FCB$ BHNDL ! THEN ;
+: CLOSE-BLOCKS ?BLOCKS FLUSH BHNDL OFF ;
+
+    

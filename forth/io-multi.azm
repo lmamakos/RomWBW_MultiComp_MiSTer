@@ -1,0 +1,428 @@
+; io-mcz80.azm
+; I/O for FPGA based Z-80 Multicomputer system
+
+
+; ------------------------------------------------------------------
+; low-level I/O words for FPGA Multicomputer emulated UART ports
+;RTS$HIGH        equ 0D5H
+;RTS$LOW         equ 095H
+;ACIA0$D         equ 081H
+;ACIA0$C         equ 080H
+
+ACIA1$D         equ 083H
+ACIA1$C         equ 082H
+
+
+;C EMIT     c --    output character to console
+    head EMIT,4,'EMIT',docode
+        LD B,C              ; put character to be transmitted in B from ToS
+        LD A,ACIA1$C        ; eventually this comes from a parameter
+        LD C,A
+emit1:  IN A,(C)
+        AND 0AH            ; n_cts and TX busy bits
+        JR Z,emit1
+        INC C               ; point to data port
+        OUT (C),B
+        POP BC              ; POP character off stack
+        NEXT
+
+;X KEY?     -- f    return true if char waiting
+    head querykey,4,'KEY?',docode
+        PUSH BC             ; raise stack
+        LD A,ACIA1$C        ; eventually this comes from parameter
+        LD C,A
+        LD B,0
+        IN A,(C)
+        AND 01h             ; bit zero is data ready
+        JR Z,qkey1
+        LD C,0
+        DEC BC              ; return -1
+qkey1:
+	NEXT
+
+;C KEY      -- c    get character from keyboard
+    head KEY,3,'KEY',docode
+        LD A,ACIA1$C        ; eventually this comes from parameter
+	PUSH BC		    ; raise stack
+        LD C,A
+        LD B,0
+key1:   IN A,(C)
+        AND 01h             ; bit zero is data ready
+        JR Z,key1
+        INC C               ; point to data port
+        IN C,(C)            ; read character to top of stack (BC)
+        NEXT
+
+;X BYE     i*x --    return to CP/M
+    head bye,3,'bye',docode
+        DI
+        out (39h),A  ; re-enable ROM
+        jp 0         ;
+
+
+
+; INIT - load first two blocks from the blocks file to boostrap
+;        additional words into the forth environment.  The
+;        code in the first block can load additional blocks
+;        very carefully..
+;X INIT      --  
+  head bootextend,4,'INIT',docolon
+    DW LIT,0,load$extend, LIT,1,load$extend, EXIT
+
+
+;X NTEST   -- 42        return 42
+    head NTEST,5,'NTEST',docode
+	PUSH BC
+	LD B,0
+	LD C,42
+;	NEXT
+	DB 0EDH,27H	; custom instruction
+	
+;X 2!  ( d a -- )
+   head TWOSTORE,2,'2!',docode
+	POP HL		; address pointer
+	INC HL ; a+1
+	INC HL ; a+2
+	LD (HL),C	; store high order word at higher address
+	INC HL ; a+3
+	LD (HL),B
+	DEC HL : a+2
+	DEC HL : a+1
+	POP BC		; get low word
+	LD (HL),B
+	DEC HL : a
+	LD (HL),C
+	POP BC		; pop low word
+	NEXT
+
+;X 2@  ( a -- d )
+   head TWOLOAD,2,'2@',docode
+
+; ------------------------------------------------------------------
+; ------------------------------------------------------------------
+; debugging output
+;
+
+putc:
+                push    af
+pc_wait:
+                in      a,(ACIA1$C)
+                and     02h
+                jr      z,pc_wait
+                pop     af
+                out     (ACIA1$D),a
+                ret
+
+puts:
+                ld      a,(hl)
+                or      a
+                ret     z
+                call    putc
+                inc     hl
+                jr      puts
+
+crlf:
+                ld      a,0Dh
+                call    putc
+                ld      a,0Ah
+                call    putc
+                ret
+
+puthex:
+                push    af
+                rrca
+                rrca
+                rrca
+                rrca
+                call    puthexnib
+                pop     af
+                call    puthexnib
+                ret
+
+puthexnib:
+                and     00Fh
+                add     a,090h
+                daa
+                adc     a,040h
+                daa
+                call    putc
+                ret
+
+puthex16:
+                ld      a,h
+                call    puthex
+                ld      a,l
+                call    puthex
+                ret
+
+afmsg: db "CF Regs  AF: ",0
+hlmsg: db ", HL(W): ",0
+demsg: db ", DE(IP): ",0
+bcmsg: db ", BC(TOS): ",0
+ixmsg: db ", IX(RSP): ",0
+iymsg: db ", IY(UP): ",0
+spmsg: db ", SP: ",0
+newline: db 13,10,0
+introdump:
+	push af
+	push hl
+	push hl
+	push af
+	ld hl,afmsg ! call puts !           pop hl ! call puthex16
+	ld hl,hlmsg ! call puts !           pop hl ! call puthex16
+	ld hl,demsg ! call puts ! push de ! pop hl ! call puthex16
+	ld hl,bcmsg ! call puts ! push bc ! pop hl ! call puthex16
+	ld hl,ixmsg ! call puts ! push ix ! pop hl ! call puthex16
+	ld hl,iymsg ! call puts ! push iy ! pop hl ! call puthex16	
+	ld hl,spmsg ! call puts ! ld hl,0 ! add hl,sp ! call puthex16	
+	ld hl,newline ! call puts
+	pop hl
+	pop af
+	ret
+	
+; ------------------------------------------------------------------
+; ------------------------------------------------------------------
+
+RAMDISK EQU 1
+
+ IFDEF RAMDISK
+;  I/O words to access the preloaded "RAM Disk" that is preloaded at
+;  the end of the 128 MB SDRAM, in the last 8MB of address space.  This
+;  was intended to preload a RAM disk for RomWBW, but we can take
+;  advantage of it here to pass in plenty of FORTH blocks just lying
+;  around in memory.
+
+
+;  The preloaded RAM starts at 
+; The SD card FPGA component does 512 byte transfers to a linear
+; array of sectors. 
+
+;  The starting physical address of the "disk image" is
+;  0x03800000
+
+; Direct access pointer ports:
+;   0xB8     Direct access pointer, bits  7:0
+;   0xB9     Direct access pointer, bits 15:8
+;   0xBA     Direct access pointer, bits 23:16
+;   0xBB     Direct access pointer, bits 31:24
+;   0xBC     Direct access data port (R/W triggers a physical memory access at
+;             the pointer; pointer post-increments after the access)
+
+addressbase:
+     dw 0000h,0380h	; 32 bit (doubleint) address, LE
+addressptr:
+     dw 0000h,0380h	; 32 bit (doubleint) address, LE
+
+  head mmuaddrbase,11,'mmuaddrbase',docon
+     dw addressbase
+
+  head mmuaddrptr,10,'mmuaddrptr',docon
+     dw addressptr
+
+
+; seek-file  ( block-num -- )
+  head file$seek,9,'seek-file',docolon
+;    dw LIT,3, LSHIFT    ; multiply block number by 8 for CPM rec#
+;    dw FCB$, LIT,33, PLUS, STORE       ; store CP/M rec into FCB random rec#
+;    dw LIT,0, LIT,35, fcb$, PLUS, CSTORE     ; zero record extension
+
+    dw DROP, LIT,-1
+    dw EXIT
+
+; read-file
+  head read$file,9,'read-file',docolon
+;    dw LIT,33, ROT, ROT, file$io
+;    dw DROP  ; ignore status
+
+    dw DROP
+    dw EXIT
+
+; write-file
+  head write$file,10,'write-file',docolon
+;    dw LIT,40, ROT, ROT, file$io
+;    dw DROP  ; ignore status    
+
+    dw EXIT
+
+
+; I know this is ugly, for now
+disk$buf    EQU 8000h
+
+; load - load and evaluate a block from the (open)
+;        block file.   Pretty bare-bones and expected
+;        to be replaced by a more sophisticated version
+;        from the FORTH environment extended after loading
+;
+;     HEX
+;     : LOAD (blocknum -- ) open-file 8000 read-file
+;       10 0 DO 8000 I 40 * + 40 2DUP CR BASE @ DECIMAL I . BASE ! 3E EMIT
+;       SPACE TYPE EVALUATE LOOP ;
+  head load$extend,4,'LOAD',docolon
+;    DW open$file
+;    DW LIT,disk$buf, read$file
+;    DW LIT,10h, LIT,0, XDO
+LOAD1:
+;    DW LIT,disk$buf, II
+;    DW LIT,40h, STAR, PLUS
+;    DW LIT,40h, TWODUP, CR
+;    DW BASE, FETCH, DECIMAL, II, DOT, BASE, STORE
+;    DW LIT,3Eh, EMIT
+;    DW SPACE, TYPE, EVALUATE
+;    DW XLOOP,LOAD1
+
+    DW DROP
+
+    DW EXIT
+
+ ELSE
+
+; ------------------------------------------------------------------
+; ------------------------------------------------------------------
+
+; low-level I/O words for Multicomputer SD card disk I/O, based
+; on the FPGA's SD card component.   This driver adapted from the
+; Multicomputer CP/M 3 BIOS code.
+;
+;
+
+;; Address Register
+;;    0    SDDATA        read/write data
+;;    1    SDSTATUS      read
+;;    1    SDCONTROL     write
+;;    2    SDLBA0        write-only
+;;    3    SDLBA1        write-only
+;;    4    SDLBA2        write-only (only bits 6:0 are valid)
+;;
+;; For both SDSC and SDHC (high capacity) cards, the block size is 512bytes (9-bit value) and the
+;; SDLBA registers select the block number. SDLBA2 is most significant, SDLBA0 is least significant.
+
+;; For SDHC cards, the read/write address parameter is the ordinal number of 512-byte block ie, the
+;; 9 low address bits are implicity 0. The 24 programmable address bits select the 512-byte block.
+;; This gives an address capacity of 2^24 * 512 = 8GByte. SDHC can be upto 32GByte but this design
+;; can only access the low 8GByte (could add SDLBA3 to get the extra address lines if required).
+;;
+;; The SDLBA registers are used like this:
+;;
+;; 31 30 29 28.27 26 25 24.23 22 21 20.19 18 17 16.15 14 13 12.11 10 09 08.07 06 05 04.03 02 01 00
+;;  0  0  0  0  0  0  0  0+---------- SDLBA2 -----+------- SDLBA1 --------+------- SDLBA0 --------+
+;;
+;; The end result of all this is that the addressing looks the same for SDSC and SDHC cards.
+;;
+;; SDSTATUS (RO)
+;;    b7     Write Data Byte can be accepted
+;;    b6     Read Data Byte available
+;;    b5     Block Busy
+;;    b4     Init Busy
+;;    b3     Unused. Read 0
+;;    b2     Unused. Read 0
+;;    b1     Unused. Read 0
+;;    b0     Unused. Read 0
+;;
+;; SDCONTROL (WO)
+;;    b7:0   0x00 Read block
+;;           0x01 Write block
+;;
+;;
+;; To read a 512-byte block from the SDCARD:
+;; Wait until SDSTATUS=0x80 (ensures previous cmd has completed)
+;; Write SDLBA0, SDLBA1 SDLBA2 to select block index to read from
+;; Write 0 to SDCONTROL to issue read command
+;; Loop 512 times:
+;;     Wait until SDSTATUS=0xE0 (read byte ready, block busy)
+;;     Read byte from SDDATA
+;;
+;; To write a 512-byte block to the SDCARD:
+;; Wait until SDSTATUS=0x80 (ensures previous cmd has completed)
+;; Write SDLBA0, SDLBA1 SDLBA2 to select block index to write to
+;; Write 1 to SDCONTROL to issue write command
+;; Loop 512 times:
+;;     Wait until SDSTATUS=0xA0 (block busy)
+;;     Write byte to SDDATA
+
+SD$DATA         equ 088H
+SD$CONTROL      equ 089H
+SD$STATUS       equ 089H
+SD$LBA0         equ 08AH
+SD$LBA1         equ 08BH
+SD$LBA2         equ 08CH
+
+SD$OUT          equ 0
+SD$IN           equ 1
+
+
+; The SD card FPGA component does 512 byte transfers to a linear
+; array of sectors. 
+
+; 24 bit LBA address
+; each 8MB volume has 16384 (512 byte) blocks - 14 bits
+;
+;; 31 30 29 28.27 26 25 24.23 22 21 20.19 18 17 16.15 14 13 12.11 10 09 08.07 06 05 04.03 02 01 00
+;;  0  0  0  0  0  0  0  0+---------- SDLBA2 -----+------- SDLBA1 --------+------- SDLBA0 --------+
+;;                            \--  Volume number [8b]--/ \-- SD (512 byte) Block number  [14b] --/
+
+
+; file-io  ( operation block# buffer-adr -- status )
+  head file$io,7,'io-file',docolon
+;    dw LIT,26, BDOS, DROP   ; set DMA address
+;    dw LIT,8, LIT,44, BDOS, DROP    ; set multi-sector count
+;    dw file$seek
+;   dw FCB$, SWOP, BDOS
+
+    dw DROP,DROP,DROP,LIT,-1
+    dw EXIT
+
+; seek-file  ( block-num -- )
+  head file$seek,9,'seek-file',docolon
+;    dw LIT,3, LSHIFT    ; multiply block number by 8 for CPM rec#
+;    dw FCB$, LIT,33, PLUS, STORE       ; store CP/M rec into FCB random rec#
+;    dw LIT,0, LIT,35, fcb$, PLUS, CSTORE     ; zero record extension
+
+    dw DROP, LIT,-1
+    dw EXIT
+
+; read-file
+  head read$file,9,'read-file',docolon
+;    dw LIT,33, ROT, ROT, file$io
+;    dw DROP  ; ignore status
+
+    dw DROP
+    dw EXIT
+
+; write-file
+  head write$file,10,'write-file',docolon
+;    dw LIT,40, ROT, ROT, file$io
+;    dw DROP  ; ignore status    
+
+    dw EXIT
+
+
+; I know this is ugly, for now
+disk$buf    EQU 8000h
+
+; load - load and evaluate a block from the (open)
+;        block file.   Pretty bare-bones and expected
+;        to be replaced by a more sophisticated version
+;        from the FORTH environment extended after loading
+;
+;     HEX
+;     : LOAD (blocknum -- ) open-file 8000 read-file
+;       10 0 DO 8000 I 40 * + 40 2DUP CR BASE @ DECIMAL I . BASE ! 3E EMIT
+;       SPACE TYPE EVALUATE LOOP ;
+  head load$extend,4,'LOAD',docolon
+;    DW open$file
+;    DW LIT,disk$buf, read$file
+;    DW LIT,10h, LIT,0, XDO
+LOAD1:
+;    DW LIT,disk$buf, II
+;    DW LIT,40h, STAR, PLUS
+;    DW LIT,40h, TWODUP, CR
+;    DW BASE, FETCH, DECIMAL, II, DOT, BASE, STORE
+;    DW LIT,3Eh, EMIT
+;    DW SPACE, TYPE, EVALUATE
+;    DW XLOOP,LOAD1
+
+    DW DROP
+
+    DW EXIT
+
+ ENDIF

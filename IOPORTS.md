@@ -1,3 +1,48 @@
+## Memory Map
+
+Pages are 16K each (14 bits).   Total address space is 256MB,
+with 128MB (SDRAM) followed by 64K of Block Ram at the start
+of the upper 128M address space - total of 27 bits.
+
+Address format:    (Virtual)
+  26 25 24.23 22 21 20.19 18 17 16.15 14 13 12.11 10 09 08.07 06 05 04.03 02 01 00
+  \--high pg#--/ \-- low order page #--/ \--- In-page low order address bits ----/
+
+                   (Logical)       15 14 13 12.11 10 09 08.07 06 05 04.03 02 01 00
+                                   \pg#/ \--------- offset in 16K page ---------/
+
+When bit 26 is zero, the lower 128MB is the SDRAM.
+When bit 26 is one, the first 64KB is the on-FPGA Block RAM memory.
+
+| Memory Address  | Page Number |  High MMU   |   Low MMU   |
+|-----------------|-------------|-------------|-------------|
+| SDRAM Start     |     0       |     0       |     0       |
+| SDRAM End       |    8191     |  0x1F / 31  | 0xFF / 255  |
+| Block RAM Start |    8192     |  0x20 / 32  | 0x00 / 0    |
+| Black RAM End   |    8195     |  0x20 / 32  | 0x03 / 3    |
+| SDRAM Disk Img  |    7680     |  0x1E / 30  | 0x00 / 0    |
+| SDRAM Disk End  |    8191     |  0x1F / 31  | 0xFF / 255  |
+
+
+Initial default mapping has:
+
+| 16K Page Frame  |  Page Number | Upper | Lower |
+|-----------------|--------------|-------|-------|
+| 0 (0000-3FFF)   |    8192      | 0x20  | 0x00  |
+| 1 (4000-7FFF)   |      1       | 0x00  | 0x01  |
+| 2 (8000-BFFF)   |      2       | 0x00  | 0x02  |
+| 3 (C000-FFFF)   |      3       | 0x00  | 0x03  |
+
+
+So the SDRAM Disk Image is at
+      3   |     8     |    0      |    0      |    0      |    0      |    0     |  
+  1  1  1  1  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0     
+  26 25 24.23 22 21 20.19 18 17 16.15 14 13 12.11 10 09 08.07 06 05 04.03 02 01 00
+  \--high pg#--/ \-- low order page #--/ \--- In-page low order address bits ----/
+       1E                  0
+
+Start phys addr 0x3800000   0x03 80 00 00
+
 ## I/O port map (reference)
 
 A consolidated list of all I/O ports identified for use by this
@@ -10,7 +55,6 @@ Entries should be kept in sync with the `n_*CS` decodes in the
 
 | Port(s)       | Width  | Core(s)   | Function                                                                                                  |
 |---------------|--------|-----------|-----------------------------------------------------------------------------------------------------------|
-| `0x20`-`0x21` | 2      | CPM       | CH376S USB module (`n_ch376sCS`). `0x20` data, `0x21` command (per `cpuAddress(0)`).                      |
 | `0x38`        | 1      | CPM       | ROM-disable trigger. Any write disables the boot ROM at `0x0000-0x1FFF` and exposes the RAM beneath it.   |
 | `0x47`        | 1      | CPM       | Front-panel data latch (R/W). Software writes drive the 8-bit transparent capture chain; reads return the last-written value. |
 | `0x80`-`0x81` | 2      | CPM, Basic| SBCTextDisplayRGB (`n_interface1CS`). VGA/PS-2 text display.                                              |

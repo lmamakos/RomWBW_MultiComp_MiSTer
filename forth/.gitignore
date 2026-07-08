@@ -1,4 +1,12 @@
-*.rel
-*.lst
+editor
+zout
+*.bin
+*.com
+*.blk
+*.hex
+*.dsk
 *.prn
+*.PRN
+*.rel
+*.sym
 *~

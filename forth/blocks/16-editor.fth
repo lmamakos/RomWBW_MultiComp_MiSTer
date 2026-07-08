@@ -1,0 +1,16 @@
+\ SCREEN EDITOR 6 OF 11
+: ?SAVE MODIFIED @ IF
+    18 5 @XY .RED  ." (S)AVE or (D)ISCARD edits? " BEGIN
+      UCKEY DUP 83 = IF     UPDATES DROP EXIT THEN
+      68 = IF .PLAIN EXIT THEN
+    AGAIN THEN ;
+
+: +BLK ( --) SCR @ HIBLK @ < IF ?SAVE  1 SCR +! RESTORE THEN ;
+: -BLK ( --) SCR @ LOBLK @ > IF ?SAVE -1 SCR +! RESTORE THEN ;
+
+: ?CLEAR ( --) 18 5 @XY .RED ." X-OUT (B)UFFER or (S)CREEN ? "
+  UCKEY DUP 66 = IF DROP BCLEAR
+                 ELSE 83 = IF SCLEAR <CXY> THEN
+                 THEN STAT ;
+
+: ?EXIT ( F -- F') ?SAVE FLUSH 1+ ;

@@ -1,17 +1,3 @@
-	.Z80
-	
-CIODEV_CONSOLE		EQU	0D0h
-CIOIN			EQU	00h 		; CHARACTER INPUT
-CIOOUT			EQU	01h		; CHARACTER OUTPUT
-CIOIST			EQU	02h 		; CHARACTER INPUT STATUS
-
-; THE FOLLOWING NEED TO BE SYNCED WITH INCLUDE.ASM SO ROMLDR
-; KNOWS WHERE THIS EXECUTES AT
-
-FTH_SIZ			EQU	8192
-FTH_LOC			EQU	0000h
-
-
 ; Listing 2.
 ; ===============================================
 ; CamelForth for the Zilog Z80
@@ -30,13 +16,13 @@ FTH_LOC			EQU	0000h
 ; You should have received a copy of the GNU General Public License
 ; along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-; Commercial inquiries should be directed to the author at
+; Commercial inquiries should be directed to the author at 
 ; 115 First St., #105, Collingwood, Ontario L9Y 4W3 Canada
 ; or via email to bj@camelforth.com
 ;
 ; ===============================================
 ; CAMEL80.AZM: Code Primitives
-;   Source code is for the ZSM assembler.
+;   Source code is for the Z80MR macro assembler.
 ;   Forth words are documented as follows:
 ;x   NAME     stack -- stack    description
 ;   where x=C for ANS Forth Core words, X for ANS
@@ -58,27 +44,6 @@ FTH_LOC			EQU	0000h
 ;       for interpreter input; TIB at 82h.
 ;   02 Mar 95 v1.02  changed ALIGN to ALIGNED in
 ;       S" (S"); changed ,BRANCH to ,XT in DO.
-;   05 Nov 18 v1.02 Initial ROMWBW HBIOS version.
-;   10-Nov 18 v1.02 New org address.
-;       b1ackmai1er difficultylevelhigh@gmail.com
-;   19-Oct 19 v1.02 Convert to zsm assembler which
-;                   identified and fixed incorrect
-;                   case conversion when lowercase
-;                   keywords are being passed in a
-;                   macro.
-;       b1ackmai1er difficultylevelhigh@gmail.com
-;   03-Dec 20 v1.02 Add James Bowmans double
-;                   precision words as per RC2014
-;                   version. Increase terminal
-;                   input buffer (TIB) size.
-;       b1ackmai1er difficultylevelhigh@gmail.com
-;   22-Jan 21 v1.02 Adjust for revised HBIOS
-;                   proxy size.
-;       b1ackmai1er difficultylevelhigh@gmail.com
-;   07-Sep 21 v1.02 Separate additions.
-;   05-Oct 21 v1.02 Add Douglas Beattie Jr.'s
-;                   API call and port read and
-;                   write words.
 ; ===============================================
 ; Macros to define Forth headers
 ; HEAD  label,length,name,action
@@ -91,17 +56,133 @@ FTH_LOC			EQU	0000h
 ;             DOCOLON, or DOCODE for code words
 ; IMMED defines a header for an IMMEDIATE word.
 ;
+	.Z80       ; M80: select Z80 mnemonics in case we forget the option
+
+; ****************************************************************
+; ****************************************************************
+
+;   This code is being assembled on the M80-compatible "UM80" Z-80
+;   assembler.  This is a python-only, portable assembler/linker/etc
+;   toolchain.  See https://github.com/avwohl/um80_and_friends for
+;   more information.
+
+;   This assembled treats the "!" specially, in two ways:
+
+;     1.  It is a "literal next" escape character, much like
+;         "\" that you're more commonly used to seeing.
+
+;         As such, IF YOU NEED TO USE THE "!" CHARACTER IN TEXT, YOU
+;         MUST ESCAPE IT: "!!" yields a single "!".
+
+;	  This is an unfortunate choice for a FORTH implementation as
+;         there are a number of FORTH words that use the "!"
+;         character in their names, such as "!" to store.  Be aware of
+;         this when reading/modifying this code.
+
+;
+;     2.  It is also used in a way that's compatible with the DRI
+;         assembler, which allows you to have muliple statements
+;         per line of text.  This onlyl applies outside of strings
+;         and macro invocations.   This feature isn't made use of
+;         in this software.
+
+; ****************************************************************
+; ****************************************************************
+
+
+; ===============================================
+; some configuration knobs  
+; CPM     EQU        1
+TIBSIZE$  EQU	     512
+
+; ===============================================
+
+      IFDEF      CPM
+        ASEG       ; this, or get rid of the ORG statement later.
+        org 100h   ; CP/M ENTRY POINT
+$ENDADDR EQU       8000h    ; might be handy to have the linker manage the start address
+
+      ELSE
+
+        ASEG
+        ORG 0000H
+RST0:	DI
+	JP	RESET	; RST 0
+
+	ORG 0008H
+RST8:
+	PUSH AF
+	LD A,08H
+	JP SPURIOUS
+	
+	ORG 0010H
+RST10:
+	PUSH AF
+	LD A,10H
+	JP SPURIOUS
+
+	ORG 0018H
+RST18:
+	PUSH AF
+	LD A,18H
+	JP SPURIOUS
+
+	ORG 0020H
+RST20:
+	PUSH AF
+	LD A,20H
+	JP SPURIOUS
+
+	ORG 0028H
+RST28:
+	PUSH AF
+	LD A,28H
+	JP SPURIOUS
+
+	ORG 0030H
+RST30:
+	PUSH AF
+	LD A,30H
+	JP SPURIOUS
+
+	ORG 0038H
+RST38:
+	PUSH AF
+	LD A,38H
+	JP SPURIOUS
+
+	ORG 0066H
+NMIRST:
+	PUSH AF
+	LD A,66H
+	; fall-thru
+
+SPURIOUS:
+	PUSH AF
+	LD HL,SPURMSG
+	CALL puts
+	POP AF
+	CALL puthex
+	HALT
+SPURMSG:
+	DB "Spurious interrupt/RST ",0
+
+$ENDADDR EQU       4000h ; end of first 16K MMU page
+      ENDIF
+
+; ===============================================
+
 DOCODE  EQU 0      ; flag to indicate CODE words
 link    DEFL 0     ; link to previous Forth word
 
-head    MACRO  label,length,name,action
+head    MACRO   label,length,name,action
         DW link
         DB 0
 link    DEFL $
-        DB length,"&name"
+        DB length,name
 label:
-        IFF (action+0 EQ DOCODE)
-        call action
+	IF (action NE DOCODE)
+          call action
         ENDIF
         ENDM
 
@@ -109,45 +190,51 @@ immed   MACRO   label,length,name,action
         DW link
         DB 1
 link    DEFL $
-        DB length,"&name"
+        DB length,name
 label:
-        IFF (action+0 EQ DOCODE)
-        call action
+	IF (action+0 NE DOCODE)
+         call action
         ENDIF
         ENDM
 
+; ===============================================
+
 ; The NEXT macro (7 bytes) assembles the 'next'
 ; code in-line in every Z80 CamelForth CODE word.
+; (MultiComp Z-80 CPU has this as a custom instruction: ED 27)
 next    MACRO
-        ex de,hl   ; next
-        ld e,(hl)  ; next
-        inc hl     ; next
-        ld d,(hl)  ; next
-        inc hl     ; next
-        ex de,hl   ; next
-        jp (hl)    ; next
+        ex de,hl   ;next
+        ld e,(hl)  ;next
+        inc hl     ;next
+        ld d,(hl)  ;next
+        inc hl     ;next
+        ex de,hl   ;next
+        jp (hl)    ;next
         ENDM
 
 ; NEXTHL is used when the IP is already in HL.
 nexthl  MACRO
-        ld e,(hl)  ; nexthl macro
-        inc hl     ; nexthl macro
-        ld d,(hl)  ; nexthl macro
-        inc hl     ; nexthl macro
-        ex de,hl   ; nexthl macro
-        jp (hl)    ; nexthl macro
+        ld e,(hl) ;nexthl
+        inc hl    ;nexthl
+        ld d,(hl) ;nexthl
+        inc hl    ;nexthl
+        ex de,hl  ;nexthl
+        jp (hl)   ;nexthl
         ENDM
 
+; ===============================================
+; ===============================================
+
 ; RESET AND INTERRUPT VECTORS ===================
-; ...are not used in the ROMWBW implementation
+; ...are not used in the CP/M implementation
 ; Instead, we have the...
 
-; RELOCATED ENTRY POINT
-
-	CSEG
-	ORG	FTH_LOC
-
-reset:  ld hl,8000h
+reset::
+        IFDEF   $ENDADDR
+         ld hl,$ENDADDR
+        ELSE
+         ld hl,(6h)  ; BDOS address, rounded down
+        ENDIF
         ld l,0       ;    = end of avail.mem (EM)
         dec h        ; EM-100h
         ld sp,hl     ;      = top of param stack
@@ -159,20 +246,40 @@ reset:  ld hl,8000h
         push hl
         pop iy       ;      = bottom of user area
         ld de,1      ; do reset if COLD returns
+ push hl
+  ld hl,hello
+  call puts
+  call introdump
+ pop hl
         jp COLD      ; enter top-level Forth word
 
-; Memory map:
+hello:  db "Hello world from CamelFORTH",13,10,0
 
-;   FTH_LOC     Forth kernel = starts after ROMLDR
+  IFDEF CPM
+; CP/M Memory map:
+;   0080h       Terminal Input Buffer, 128 bytes (for CP/M)
+;   0100h       Forth kernel = start of CP/M TPA
 ;     ? h       Forth dictionary (user RAM)
-;   EM-400h     Terminal Input Buffer, 512 bytes
-;		Below user area
 ;   EM-200h     User area, 128 bytes
 ;   EM-180h     Parameter stack, 128B, grows down
 ;   EM-100h     HOLD area, 40 bytes, grows down
 ;   EM-0D8h     PAD buffer, 88 bytes
 ;   EM-80h      Return stack, 128 B, grows down
-;   EM=8000h    End of RAM 
+;   EM          End of RAM = start of CP/M BDOS
+ ELSE
+; MultiComp Memory Map:
+;   0000h       Forth kernel = start of memory
+;     ? h       Forth dictionary (user RAM)
+;   EM-200h-128 TIB (for non CP/M systems)
+;   EM-200h     User area, 128 bytes
+;   EM-180h     Parameter stack, 128B, grows down
+;   EM-100h     HOLD area, 40 bytes, grows down
+;   EM-0D8h     PAD buffer, 88 bytes
+;   EM-80h     Return stack, 128 B, grows down
+;   EM          End of RAM = start of CP/M BDOS
+ ENDIF
+
+
 ; See also the definitions of U0, S0, and R0
 ; in the "system variables & constants" area.
 ; A task w/o terminal input requires 200h bytes.
@@ -182,7 +289,7 @@ reset:  ld hl,8000h
 ; See also "defining words" at end of this file
 
 ;C EXIT     --      exit a colon definition
-    head EXIT,4,EXIT,docode
+    head EXIT,4,'EXIT',docode
         ld e,(ix+0)    ; pop old IP from ret stk
         inc ix
         ld d,(ix+0)
@@ -191,7 +298,7 @@ reset:  ld hl,8000h
 
 ;Z lit      -- x    fetch inline literal to stack
 ; This is the primtive compiled by LITERAL.
-    head lit,3,lit,docode
+    head lit,3,'lit',docode
         push bc        ; push old TOS
         ld a,(de)      ; fetch cell at IP to TOS,
         ld c,a         ;        advancing IP
@@ -203,7 +310,7 @@ reset:  ld hl,8000h
 
 ;C EXECUTE   i*x xt -- j*x   execute Forth word
 ;C                           at 'xt'
-    head EXECUTE,7,EXECUTE,docode
+    head EXECUTE,7,'EXECUTE',docode
         ld h,b          ; address of word -> HL
         ld l,c
         pop bc          ; get new TOS
@@ -216,7 +323,7 @@ reset:  ld hl,8000h
 ; (internal code fragment, not a Forth word)
 ; N.B.: DOCOLON must be defined before any
 ; appearance of 'docolon' in a 'word' macro!
-docolon:               ; (alternate name)
+docolon::              ; (alternate name)
 enter:  dec ix         ; push old IP on ret stack
         ld (ix+0),d
         dec ix
@@ -228,11 +335,11 @@ enter:  dec ix         ; push old IP on ret stack
 ;   CREATE 1 CELLS ALLOT ;
 ; Action of RAM variable is identical to CREATE,
 ; so we don't need a DOES> clause to change it.
-    head VARIABLE,8,VARIABLE,docolon
+    head VARIABLE,8,'VARIABLE',docolon
         DW CREATE,LIT,1,CELLS,ALLOT,EXIT
 ; DOVAR, code action of VARIABLE, entered by CALL
 ; DOCREATE, code action of newly created words
-docreate:
+docreate::
 dovar:  ; -- a-addr
         pop hl     ; parameter field address
         push bc    ; push old TOS
@@ -242,11 +349,11 @@ dovar:  ; -- a-addr
 
 ;C CONSTANT   n --      define a Forth constant
 ;   CREATE , DOES> (machine code fragment)
-    head CONSTANT,8,CONSTANT,docolon
+    head CONSTANT,8,'CONSTANT',docolon
         DW CREATE,COMMA,XDOES
 ; DOCON, code action of CONSTANT,
 ; entered by CALL DOCON
-docon:  ; -- x
+docon: ; -- x
         pop hl     ; parameter field address
         push bc    ; push old TOS
         ld c,(hl)  ; fetch contents of parameter
@@ -256,11 +363,11 @@ docon:  ; -- x
 
 ;Z USER     n --        define user variable 'n'
 ;   CREATE , DOES> (machine code fragment)
-    head USER,4,USER,docolon
+    head USER,4,'USER',docolon
         DW CREATE,COMMA,XDOES
 ; DOUSER, code action of USER,
 ; entered by CALL DOUSER
-douser:  ; -- a-addr
+douser::  ; -- a-addr
         pop hl     ; parameter field address
         push bc    ; push old TOS
         ld c,(hl)  ; fetch contents of parameter
@@ -282,7 +389,7 @@ douser:  ; -- a-addr
 ; Enters high-level thread with address of
 ; parameter field on top of stack.
 ; (internal code fragment, not a Forth word)
-dodoes: ; -- a-addr
+dodoes:: ; -- a-addr
         dec ix         ; push old IP on ret stk
         ld (ix+0),d
         dec ix
@@ -294,86 +401,27 @@ dodoes: ; -- a-addr
         ld c,l
         next
 
-; CP/M TERMINAL I/O =============================
-
-;C EMIT     c --    output character to console
-    head EMIT,4,EMIT,docode
-		PUSH	DE
-		PUSH	HL					; OUTPUT CHARACTER TO CONSOLE VIA HBIOS
-		LD		E,C					; OUTPUT CHAR TO E
-		LD		C,CIODEV_CONSOLE	; CONSOLE UNIT TO C
-		LD		B,CIOOUT			; HBIOS FUNC: OUTPUT CHAR
-		RST		08					; HBIOS OUTPUTS CHARACTER
-		POP		HL
-		POP		DE
-		pop		BC					; PUT TOP OF STACK IN BC
-		next
-;
-;Z SAVEKEY  -- addr  temporary storage for KEY?
-    head savekey,7,SAVEKEY,dovar
-SVKY:	DW 0
-
-;X KEY?     -- f    return true if char waiting
-    head querykey,4,KEY?,docode
-		PUSH	BC					; SAVE TOP OF STACK
-		PUSH	DE
-		PUSH	HL					; GET CONSOLE INPUT STATUS VIA HBIOS
-		LD		C,CIODEV_CONSOLE	; CONSOLE UNIT TO C
-		LD		B,CIOIST			; HBIOS FUNC: INPUT STATUS
-		RST		08					; HBIOS RETURNS STATUS IN A
-		LD		B,A
-		OR		A
-		JR		Z,key3				; INPUT CHARACTER FROM CONSOLE VIA HBIOS
-		LD		C,CIODEV_CONSOLE	; CONSOLE UNIT TO C
-		LD		B,CIOIN				; HBIOS FUNC: INPUT CHAR
-		RST		08					; HBIOS READS CHARACTDR
-		LD		B,E
-key3:	LD		C,0
-		LD		HL,SVKY
-		LD		(HL),B
-		INC		HL
-		LD		(HL),C
-		POP		HL
-		POP		DE
-		next
-
-;C KEY      -- c    get character from keyboard
-;   BEGIN SAVEKEY C@ 0= WHILE KEY? DROP REPEAT
-;   SAVEKEY C@  0 SAVEKEY C! ;
-    head KEY,3,KEY,docolon
-KEY1:   DW SAVEKEY,CFETCH,ZEROEQUAL,qbranch,KEY2
-        DW QUERYKEY,DROP,branch,KEY1
-KEY2:   DW SAVEKEY,CFETCH,LIT,0,SAVEKEY,CSTORE
-        DW EXIT
-
-;X BYE     i*x --    return to CP/M
-    head bye,3,bye,docode
-    	 HALT
-;		LD	B,BF_SYSRESET		; SYSTEM RESTART
-;		LD	C,BF_SYSRES_WARM	; WARM START
-;		JP	0FFF0h			; CALL HBIOS
-
 ; STACK OPERATIONS ==============================
 
 ;C DUP      x -- x x      duplicate top of stack
-    head DUP,3,DUP,docode
+    head DUP,3,'DUP',docode
 pushtos: push bc
         next
 
 ;C ?DUP     x -- 0 | x x    DUP if nonzero
-    head QDUP,4,?DUP,docode
+    head QDUP,4,'?DUP',docode
         ld a,b
         or c
         jr nz,pushtos
         next
 
 ;C DROP     x --          drop top of stack
-    head DROP,4,DROP,docode
+    head DROP,4,'DROP',docode
 poptos: pop bc
         next
 
 ;C SWAP     x1 x2 -- x2 x1    swap top two items
-    head SWOP,4,SWAP,docode
+    head SWOP,4,'SWAP',docode
         pop hl
         push bc
         ld b,h
@@ -381,7 +429,7 @@ poptos: pop bc
         next
 
 ;C OVER    x1 x2 -- x1 x2 x1   per stack diagram
-    head OVER,4,OVER,docode
+    head OVER,4,'OVER',docode
         pop hl
         push hl
         push bc
@@ -390,7 +438,7 @@ poptos: pop bc
         next
 
 ;C ROT    x1 x2 x3 -- x2 x3 x1  per stack diagram
-    head ROT,3,ROT,docode
+    head ROT,3,'ROT',docode
         ; x3 is in TOS
         pop hl          ; x2
         ex (sp),hl      ; x2 on stack, x1 in hl
@@ -400,15 +448,15 @@ poptos: pop bc
         next
 
 ;X NIP    x1 x2 -- x2           per stack diagram
-    head NIP,3,NIP,docolon
+    head NIP,3,'NIP',docolon
         DW SWOP,DROP,EXIT
 
 ;X TUCK   x1 x2 -- x2 x1 x2     per stack diagram
-    head TUCK,4,TUCK,docolon
+    head TUCK,4,'TUCK',docolon
         DW SWOP,OVER,EXIT
 
 ;C >R    x --   R: -- x   push to return stack
-    head TOR,2,!>R,docode
+    head TOR,2,'>R',docode
         dec ix          ; push TOS onto rtn stk
         ld (ix+0),b
         dec ix
@@ -417,7 +465,7 @@ poptos: pop bc
         next
 
 ;C R>    -- x    R: x --   pop from return stack
-    head RFROM,2,R!>,docode
+    head RFROM,2,'R>',docode
         push bc         ; push old TOS
         ld c,(ix+0)     ; pop top rtn stk item
         inc ix          ;       to TOS
@@ -426,14 +474,14 @@ poptos: pop bc
         next
 
 ;C R@    -- x     R: x -- x   fetch from rtn stk
-    head RFETCH,2,R@,docode
+    head RFETCH,2,'R@',docode
         push bc         ; push old TOS
         ld c,(ix+0)     ; fetch top rtn stk item
         ld b,(ix+1)     ;       to TOS
         next
 
 ;Z SP@  -- a-addr       get data stack pointer
-    head SPFETCH,3,SP@,docode
+    head SPFETCH,3,'SP@',docode
         push bc
         ld hl,0
         add hl,sp
@@ -442,7 +490,7 @@ poptos: pop bc
         next
 
 ;Z SP!  a-addr --       set data stack pointer
-    head SPSTORE,3,SP!!,docode
+    head SPSTORE,3,'SP!!',docode
         ld h,b
         ld l,c
         ld sp,hl
@@ -450,14 +498,14 @@ poptos: pop bc
         next
 
 ;Z RP@  -- a-addr       get return stack pointer
-    head RPFETCH,3,RP@,docode
+    head RPFETCH,3,'RP@',docode
         push bc
         push ix
         pop bc
         next
 
 ;Z RP!  a-addr --       set return stack pointer
-    head RPSTORE,3,RP!!,docode
+    head RPSTORE,3,'RP!!',docode
         push bc
         pop ix
         pop bc
@@ -466,7 +514,7 @@ poptos: pop bc
 ; MEMORY AND I/O OPERATIONS =====================
 
 ;C !        x a-addr --   store cell in memory
-    head STORE,1,!!,docode
+    head STORE,1,'!!',docode
         ld h,b          ; address in hl
         ld l,c
         pop bc          ; data in bc
@@ -477,7 +525,7 @@ poptos: pop bc
         next
 
 ;C C!      char c-addr --    store char in memory
-    head CSTORE,2,C!!,docode
+    head CSTORE,2,'C!!',docode
         ld h,b          ; address in hl
         ld l,c
         pop bc          ; data in bc
@@ -486,7 +534,7 @@ poptos: pop bc
         next
 
 ;C @       a-addr -- x   fetch cell from memory
-    head FETCH,1,@,docode
+    head FETCH,1,'@',docode
         ld h,b          ; address in hl
         ld l,c
         ld c,(hl)
@@ -495,21 +543,21 @@ poptos: pop bc
         next
 
 ;C C@     c-addr -- char   fetch char from memory
-    head CFETCH,2,C@,docode
+    head CFETCH,2,'C@',docode
         ld a,(bc)
         ld c,a
         ld b,0
         next
 
 ;Z PC!     char c-addr --    output char to port
-    head PCSTORE,3,PC!!,docode
+    head PCSTORE,3,'PC!!',docode
         pop hl          ; char in L
         out (c),l       ; to port (BC)
         pop bc          ; pop new TOS
         next
 
 ;Z PC@     c-addr -- char   input char from port
-    head PCFETCH,3,PC@,docode
+    head PCFETCH,3,'PC@',docode
         in c,(c)        ; read port (BC) to C
         ld b,0
         next
@@ -517,7 +565,7 @@ poptos: pop bc
 ; ARITHMETIC AND LOGICAL OPERATIONS =============
 
 ;C +       n1/u1 n2/u2 -- n3/u3     add n1+n2
-    head PLUS,1,+,docode
+    head PLUS,1,'+',docode
         pop hl
         add hl,bc
         ld b,h
@@ -525,7 +573,7 @@ poptos: pop bc
         next
 
 ;X M+       d n -- d         add single to double
-    head MPLUS,2,M+,docode
+    head MPLUS,2,'M+',docode
         ex de,hl
         pop de          ; hi cell
         ex (sp),hl      ; lo cell, save IP
@@ -539,7 +587,7 @@ mplus1: pop de          ; restore saved IP
         next
 
 ;C -      n1/u1 n2/u2 -- n3/u3    subtract n1-n2
-    head MINUS,1,-,docode
+    head MINUS,1,'-',docode
         pop hl
         or a
         sbc hl,bc
@@ -548,7 +596,7 @@ mplus1: pop de          ; restore saved IP
         next
 
 ;C AND    x1 x2 -- x3            logical AND
-    head AND,3,AND,docode
+    head aAND,3,'AND',docode
         pop hl
         ld a,b
         and h
@@ -559,7 +607,7 @@ mplus1: pop de          ; restore saved IP
         next
 
 ;C OR     x1 x2 -- x3           logical OR
-    head OR,2,OR,docode
+    head oOR,2,'OR',docode
         pop hl
         ld a,b
         or h
@@ -570,7 +618,7 @@ mplus1: pop de          ; restore saved IP
         next
 
 ;C XOR    x1 x2 -- x3            logical XOR
-    head XOR,3,XOR,docode
+    head xXOR,3,'XOR',docode
         pop hl
         ld a,b
         xor h
@@ -581,7 +629,7 @@ mplus1: pop de          ; restore saved IP
         next
 
 ;C INVERT   x1 -- x2            bitwise inversion
-    head INVERT,6,INVERT,docode
+    head INVERT,6,'INVERT',docode
         ld a,b
         cpl
         ld b,a
@@ -591,7 +639,7 @@ mplus1: pop de          ; restore saved IP
         next
 
 ;C NEGATE   x1 -- x2            two's complement
-    head NEGATE,6,NEGATE,docode
+    head NEGATE,6,'NEGATE',docode
         ld a,b
         cpl
         ld b,a
@@ -602,36 +650,36 @@ mplus1: pop de          ; restore saved IP
         next
 
 ;C 1+      n1/u1 -- n2/u2       add 1 to TOS
-    head ONEPLUS,2,1+,docode
+    head ONEPLUS,2,'1+',docode
         inc bc
         next
 
 ;C 1-      n1/u1 -- n2/u2     subtract 1 from TOS
-    head ONEMINUS,2,1-,docode
+    head ONEMINUS,2,'1-',docode
         dec bc
         next
 
 ;Z ><      x1 -- x2         swap bytes (not ANSI)
-    head swapbytes,2,!>!<,docode
+    head swapbytes,2,'><',docode
         ld a,b
         ld b,c
         ld c,a
         next
 
 ;C 2*      x1 -- x2         arithmetic left shift
-    head TWOSTAR,2,2*,docode
+    head TWOSTAR,2,'2*',docode
         sla c
         rl b
         next
 
 ;C 2/      x1 -- x2        arithmetic right shift
-    head TWOSLASH,2,2/,docode
+    head TWOSLASH,2,'2/',docode
         sra b
         rr c
         next
 
 ;C LSHIFT  x1 u -- x2    logical L shift u places
-    head LSHIFT,6,LSHIFT,docode
+    head LSHIFT,6,'LSHIFT',docode
         ld b,c        ; b = loop counter
         pop hl        ;   NB: hi 8 bits ignored!
         inc b         ; test for counter=0 case
@@ -643,7 +691,7 @@ lsh2:   djnz lsh1
         next
 
 ;C RSHIFT  x1 u -- x2    logical R shift u places
-    head RSHIFT,6,RSHIFT,docode
+    head RSHIFT,6,'RSHIFT',docode
         ld b,c        ; b = loop counter
         pop hl        ;   NB: hi 8 bits ignored!
         inc b         ; test for counter=0 case
@@ -656,7 +704,7 @@ rsh2:   djnz rsh1
         next
 
 ;C +!     n/u a-addr --       add cell to memory
-    head PLUSSTORE,2,+!!,docode
+    head PLUSSTORE,2,'+!!',docode
         pop hl
         ld a,(bc)       ; low byte
         add a,l
@@ -671,7 +719,7 @@ rsh2:   djnz rsh1
 ; COMPARISON OPERATIONS =========================
 
 ;C 0=     n/u -- flag    return true if TOS=0
-    head ZEROEQUAL,2,0=,docode
+    head ZEROEQUAL,2,'0=',docode
         ld a,b
         or c            ; result=0 if bc was 0
         sub 1           ; cy set   if bc was 0
@@ -681,7 +729,7 @@ rsh2:   djnz rsh1
         next
 
 ;C 0<     n -- flag      true if TOS negative
-    head ZEROLESS,2,0!<,docode
+    head ZEROLESS,2,'0<',docode
         sla b           ; sign bit -> cy flag
         sbc a,a         ; propagate cy through A
         ld b,a          ; put 0000 or FFFF in TOS
@@ -689,7 +737,7 @@ rsh2:   djnz rsh1
         next
 
 ;C =      x1 x2 -- flag         test x1=x2
-    head EQUAL,1,=,docode
+    head EQUAL,1,'=',docode
         pop hl
         or a
         sbc hl,bc       ; x1-x2 in HL, SZVC valid
@@ -698,11 +746,11 @@ tosfalse: ld bc,0
         next
 
 ;X <>     x1 x2 -- flag    test not eq (not ANSI)
-    head NOTEQUAL,2,!<!>,docolon
+    head NOTEQUAL,2,'<>',docolon
         DW EQUAL,ZEROEQUAL,EXIT
 
 ;C <      n1 n2 -- flag        test n1<n2, signed
-    head LESS,1,!<,docode
+    head LESS,1,'<',docode
         pop hl
         or a
         sbc hl,bc       ; n1-n2 in HL, SZVC valid
@@ -719,11 +767,11 @@ revsense: jp m,tosfalse ; OV: if -ve, reslt false
         jr tostrue      ;     if +ve, result true
 
 ;C >     n1 n2 -- flag         test n1>n2, signed
-    head GREATER,1,!>,docolon
+    head GREATER,1,'>',docolon
         DW SWOP,LESS,EXIT
 
 ;C U<    u1 u2 -- flag       test u1<n2, unsigned
-    head ULESS,2,U!<,docode
+    head ULESS,2,'U<',docode
         pop hl
         or a
         sbc hl,bc       ; u1-u2 in HL, SZVC valid
@@ -733,13 +781,13 @@ revsense: jp m,tosfalse ; OV: if -ve, reslt false
         next
 
 ;X U>    u1 u2 -- flag     u1>u2 unsgd (not ANSI)
-    head UGREATER,2,U!>,docolon
+    head UGREATER,2,'U>',docolon
         DW SWOP,ULESS,EXIT
 
 ; LOOP AND BRANCH OPERATIONS ====================
 
 ;Z branch   --                  branch always
-    head branch,6,branch,docode
+    head branch,6,'branch',docode
 dobranch: ld a,(de)     ; get inline value => IP
         ld l,a
         inc de
@@ -748,7 +796,7 @@ dobranch: ld a,(de)     ; get inline value => IP
         nexthl
 
 ;Z ?branch   x --              branch if TOS zero
-    head qbranch,7,?branch,docode
+    head qbranch,7,'?branch',docode
         ld a,b
         or c            ; test old TOS
         pop bc          ; pop new TOS
@@ -767,7 +815,7 @@ dobranch: ld a,(de)     ; get inline value => IP
 ; I learned this trick from Laxen & Perry F83.
 ; fudge factor = 8000h-limit, to be added to
 ; the start value.
-    head xdo,4,(do),docode
+    head xdo,4,'(do)',docode
         ex de,hl
         ex (sp),hl   ; IP on stack, limit in HL
         ex de,hl
@@ -793,7 +841,7 @@ dobranch: ld a,(de)     ; get inline value => IP
 ; clean up the return stack and skip the branch.
 ; Else take the inline branch.  Note that LOOP
 ; terminates when index=8000h.
-    head xloop,6,(loop),docode
+    head xloop,6,'(loop)',docode
         exx
         ld bc,1
 looptst: ld l,(ix+0)  ; get the loop index
@@ -819,7 +867,7 @@ loopterm: ; terminate the loop
 ; Add n to the loop index.  If loop terminates,
 ; clean up the return stack and skip the branch.
 ; Else take the inline branch.
-    head xplusloop,7,(+loop),docode
+    head xplusloop,7,'(+loop)',docode
         pop hl      ; this will be the new TOS
         push bc
         ld b,h
@@ -830,7 +878,7 @@ loopterm: ; terminate the loop
 
 ;C I        -- n   R: sys1 sys2 -- sys1 sys2
 ;C                  get the innermost loop index
-    head II,1,I,docode
+    head II,1,'I',docode
         push bc     ; push old TOS
         ld l,(ix+0) ; get current loop index
         ld h,(ix+1)
@@ -844,7 +892,7 @@ loopterm: ; terminate the loop
 
 ;C J        -- n   R: 4*sys -- 4*sys
 ;C                  get the second loop index
-    head JJ,1,J,docode
+    head JJ,1,'J',docode
         push bc     ; push old TOS
         ld l,(ix+4) ; get current loop index
         ld h,(ix+5)
@@ -857,7 +905,7 @@ loopterm: ; terminate the loop
         next
 
 ;C UNLOOP   --   R: sys1 sys2 --  drop loop parms
-    head UNLOOP,6,UNLOOP,docode
+    head UNLOOP,6,'UNLOOP',docode
         inc ix
         inc ix
         inc ix
@@ -867,7 +915,7 @@ loopterm: ; terminate the loop
 ; MULTIPLY AND DIVIDE ===========================
 
 ;C UM*     u1 u2 -- ud   unsigned 16x16->32 mult.
-    head UMSTAR,3,UM*,docode
+    head UMSTAR,3,'UM*',docode
         push bc
         exx
         pop bc      ; u2 in BC
@@ -890,7 +938,7 @@ noadd:  dec a
         next
 
 ;C UM/MOD   ud u1 -- u2 u3   unsigned 32/16->16
-    head UMSLASHMOD,6,UM/MOD,docode
+    head UMSLASHMOD,6,'UM/MOD',docode
         push bc
         exx
         pop bc      ; BC = divisor
@@ -932,7 +980,7 @@ udiv4:  rl e        ; rotate result bit into DE,
 ; BLOCK AND STRING OPERATIONS ===================
 
 ;C FILL   c-addr u char --  fill memory with char
-    head FILL,4,FILL,docode
+    head FILL,4,'FILL',docode
         ld a,c          ; character in a
         exx             ; use alt. register set
         pop bc          ; count in bc
@@ -957,7 +1005,7 @@ filldone: exx           ; back to main reg set
 ; On byte machines, CMOVE and CMOVE> are logical
 ; factors of MOVE.  They are easy to implement on
 ; CPUs which have a block-move instruction.
-    head CMOVE,5,CMOVE,docode
+    head CMOVE,5,'CMOVE',docode
         push bc
         exx
         pop bc      ; count
@@ -973,7 +1021,7 @@ cmovedone: exx
 
 ;X CMOVE>  c-addr1 c-addr2 u --  move from top
 ; as defined in the ANSI optional String word set
-    head CMOVEUP,6,CMOVE!>,docode
+    head CMOVEUP,6,'CMOVE>',docode
         push bc
         exx
         pop bc      ; count
@@ -998,7 +1046,7 @@ umovedone: exx
 ; ideal factors of WORD and FIND, they closely
 ; follow the string operations available on many
 ; CPUs, and so are easy to implement and fast.
-    head skip,4,SKIP,docode
+    head skip,4,'SKIP',docode
         ld a,c      ; skip character
         exx
         pop bc      ; count
@@ -1022,7 +1070,7 @@ skipdone: push hl   ; updated address
 
 ;Z SCAN    c-addr u c -- c-addr' u'
 ;Z                      find matching char
-    head scan,4,SCAN,docode
+    head scan,4,'SCAN',docode
         ld a,c      ; scan character
         exx
         pop bc      ; count
@@ -1044,7 +1092,7 @@ scandone: push hl   ; updated address
 
 ;Z S=    c-addr1 c-addr2 u -- n   string compare
 ;Z             n<0: s1<s2, n=0: s1=s2, n>0: s1>s2
-    head sequal,2,S=,docode
+    head sequal,2,'S=',docode
         push bc
         exx
         pop bc      ; count
@@ -1072,24 +1120,23 @@ sdiff:  ; mismatch!  undo last 'cpi' increment
         ld c,a
 snext:  next
 
- INCLUDE camel80d.azm   ; CPU Dependencies
- INCLUDE camel80h.azm   ; High Level words
- INCLUDE camel80r.azm   ; ROMWBW additions
- ;INCLUDE cameltst.azm   ; Test Functions
+; include CPU dependencies
+        INCLUDE camel80d.azm   ; CPU Dependencies
+
+; include High Level words
+        INCLUDE camel80h.azm   ; High Level words
+
+      IFDEF CPM
+        INCLUDE io-cpm.azm  ; include CP/M file I/O low-level words
+enddict EQU $       ; user's code starts here
+      ELSE
+        INCLUDE io-multi.azm ; include Z80 Multicomputer ROM words
+; enddict EQU $ENDADDR    ; continue userdict at start of RAM bank
+  	      		  ;
+enddict  EQU $		  ; on the multicomputer, FORTH is loaded into RAM, so
+	     		  ; dictionary can continue here.
+      ENDIF
 
 lastword EQU link   ; nfa of last word in dict.
-enddict EQU $       ; user's code starts here
 
-		; force padding to page boundary
-
-IF ((enddict-reset) GT FTH_SIZ)
- IF2
-	FORTH SIZE ERROR
- ENDIF
-ELSE
-	ds (FTH_SIZ-(enddict-reset)-1)
-	nop
-ENDIF
-
-        END
-
+        END 	   RESET

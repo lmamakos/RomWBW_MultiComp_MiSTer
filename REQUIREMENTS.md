@@ -156,10 +156,32 @@ and started.
 This feature should use the MiSTer configuration string to specify the
 options to load the Boot ROM and RAM disk images.
 
+### Integrated Camel FORTH
+
+A more powerful tool than BASIC is required for further testing of the
+HDL changes, and more generally, Z-80 "monitor program" than can be
+booted.  We are going to integrate Camel FORTH into the system, which
+is present in the `forth` top-level directory.  This will enable
+interactive testing.
+
+The intent is to take advantage of the "ROM Boot" capability that was
+recently added to the project, which can preload memory starting at
+logical address 0x0000.  This will be used for a variety of purposes,
+eventually intended to load and start RomWBW.  It can also be used to
+load a FORTH interpreter as an alternative to the Basic / CP/M Boot
+ROM that is built into the FPGA image.  Loading this from the ARM
+processor's file system will enable easy updates of the code without
+having to rebuild the FPGA image.
+
+The FORTH interpreter presently runs.  The next feature to complete in
+Camel FORTH is to give it access to the 8 MB "RAM Disk" that can be
+preloaded from a specified file from the MiSTer OSD.  This image will
+contain FORTH blocks with addtional FORTH word definitions than can
+be used to extend the base interpreter.
 
 ## Progress
 
-### MMU rework (`Components/alancox/MMU.vhd`) — design complete, GHDL-verified, not yet in the build
+### MMU rework (`Components/alancox/MMU.vhd`) — design complete, GHDL-verified,
 
 The MMU source file has been rewritten in place to match the requirements
 above. GHDL (`ghdl -a --std=08`) accepts the file with no errors.
@@ -929,6 +951,12 @@ must be redefined to emit the single opcode (`DB 0EDh,27h`) instead of the
 7-instruction sequence. CamelFORTH source is not yet present in this repo
 (the RomWBW/FORTH port is future work).
 
+#### Testing Status
+
+A cursory test of this instruction reveals that it fails.  Additional,
+more detailed tests will be required to further diagnose the new
+"NEXT" instruction.
+
 ### Loadable Boot ROM (`.BIN`) and RAM-disk (`.DSK`) images from the OSD — HDL implemented, hardware test pending
 
 The OSD file-download feature is implemented across `MultiComp.sv` (top
@@ -1252,7 +1280,8 @@ real-world misbehaviour:
    microcode is implemented and GHDL-verified, but not yet tested on
    silicon. Confirm `HL = W`, `IP += 2`, and `PC := W` behave correctly,
    then redefine the CamelFORTH `next` macro to emit `DB 0EDh,27h` and
-   re-run the FORTH test suite.
+   re-run the FORTH test suite.  Initial testing inside the Camel FORTH
+   interpreter fails.  Further diagnosis and testing required.
 9. **Loadable Boot ROM (`.BIN`) / RAM-disk (`.DSK`) from OSD hardware
    bring-up**: HDL implemented across `MultiComp.sv` and
    `MicrocomputerZ80CPM.vhd` (see the progress entry above). Quartus-compile
@@ -1326,13 +1355,14 @@ widening work, for whoever picks it up next.
 
 ### Suggested next steps (priority order)
 
-1. **Front-panel hardware bring-up** (outstanding item 2) — the subsystem
+1. **Implement "RAM Disk" access inside of Camel FORTH. 
+2. **Front-panel hardware bring-up** (outstanding item 2) — the subsystem
    is wired but never lit on real hardware.
-2. **MMU reset map** (item 4) — decide on a sensible default beyond the
+3. **MMU reset map** (item 4) — decide on a sensible default beyond the
    placeholder identity map now that SDRAM is real.
-3. **Legacy memory cleanup** (item 7) — remove dead `externalRam` /
+4. **Legacy memory cleanup** (item 7) — remove dead `externalRam` /
    `internalRam2` signals from `MicrocomputerZ80CPM.vhd`.
-4. **Begin the RomWBW port** — the original project goal. The 128 MB
+5. **Begin the RomWBW port** — the original project goal. The 128 MB
    paged-memory foundation (MMU + SDRAM, with a verified direct-access
    window for inter-bank copies) is now in place to host it.
 

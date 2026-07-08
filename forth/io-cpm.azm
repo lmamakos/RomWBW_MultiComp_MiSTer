@@ -1,0 +1,152 @@
+; io-cpm.azm
+
+
+; CP/M TERMINAL I/O =============================
+cpmbdos EQU 5h          ; CP/M BDOS entry point
+
+;Z BDOS   de c -- a   call CP/M BDOS
+    head BDOS,4,'BDOS',docode
+        ex de,hl    ; save important Forth regs
+        pop de      ;  (DE,IX,IY) & pop DE value
+        push hl
+        push ix
+        push iy
+        call cpmbdos
+        ld c,a      ; result in TOS
+        ld b,0
+        pop iy      ; restore Forth regs
+        pop ix
+        pop de
+        next
+
+;C EMIT     c --    output character to console
+;   6 BDOS DROP ;
+; warning: if c=0ffh, will read one keypress
+    head EMIT,4,'EMIT',docolon
+        DW LIT,06H,BDOS,DROP,EXIT
+
+;Z SAVEKEY  -- addr  temporary storage for KEY?
+    head savekey,7,'SAVEKEY',dovar
+        DW 0
+
+;X KEY?     -- f    return true if char waiting
+;   0FF 6 BDOS DUP SAVEKEY C! ;   rtns 0 or key
+; must use BDOS function 6 to work with KEY
+    head querykey,4,'KEY?',docolon
+        DW LIT,0FFH,LIT,06H,BDOS
+        DW DUP,SAVEKEY,CSTORE,EXIT
+
+;C KEY      -- c    get character from keyboard
+;   BEGIN SAVEKEY C@ 0= WHILE KEY? DROP REPEAT
+;   SAVEKEY C@  0 SAVEKEY C! ;
+; must use CP/M direct console I/O to avoid echo
+; (BDOS function 6, contained within KEY?)
+    head KEY,3,'KEY',docolon
+KEY1:   DW SAVEKEY,CFETCH,ZEROEQUAL,qbranch,KEY2
+        DW QUERYKEY,DROP,branch,KEY1
+KEY2:   DW SAVEKEY,CFETCH,LIT,0,SAVEKEY,CSTORE
+        DW EXIT
+
+;Z CPMACCEPT  c-addr +n -- +n'  get line of input
+;   SWAP 2 - TUCK C!      max # of characters
+;   DUP 0A BDOS DROP      CP/M Get Console Buffer
+;   1+ C@  0A EMIT ;      get returned count
+; Note: requires the two locations before c-addr
+; to be available for use.
+    head CPMACCEPT,9,'CPMACCEPT',docolon
+        DW SWOP,LIT,2,MINUS,TUCK,CSTORE
+        DW DUP,LIT,0Ah,BDOS,DROP
+        DW ONEPLUS,CFETCH,LIT,0Ah,EMIT,EXIT
+
+;X BYE     i*x --    return to CP/M
+    head bye,3,'bye',docode
+        jp 0
+
+; ------------------------------------------------------------------
+; CPM low-level I/O words to CP/M file system
+;
+;  8 char name, 3 char "type"
+;              '12345678'
+block$name: db 'FORTH   '  ; EXACTLY 8 charactersxsxsxsxsxsxsx
+            db 'BLK'       ; EXACTLY 3 characters
+            IF $-block$name NE 11
+            DB $-block$name
+            COMMENT |CP/M File Name wrong length|
+            DS CP/M File Name wrong length
+            ENDIF
+
+; define space for single CP/M FCB to do this simple I/O
+fcb$buf:  DS 40
+  head fcb$,4,'FCB$',docon
+    dw fcb$buf
+
+  head open$file,9,'open-file',docolon
+    dw fcb$,LIT,36,LIT,0,FILL  ; zero out the FCB
+
+    dw LIT,block$name, fcb$, LIT, 1, PLUS, LIT,11
+    dw CMOVE    ; copy in the file name
+
+    dw fcb$,LIT,15,BDOS ; BDOS open
+    dw DROP   ; probably should check the return status..
+    dw EXIT
+
+; file-io  ( operation block# buffer-adr -- status )
+  head file$io,7,'io-file',docolon
+    dw LIT,26, BDOS, DROP   ; set DMA address
+    dw LIT,8, LIT,44, BDOS, DROP    ; set multi-sector count
+    dw file$seek
+    dw FCB$, SWOP, BDOS
+    dw EXIT
+
+; seek-file  ( block-num -- )
+  head file$seek,9,'seek-file',docolon
+    dw LIT,3, LSHIFT    ; multiply block number by 8 for CPM rec#
+    dw FCB$, LIT,33, PLUS, STORE       ; store CP/M rec into FCB random rec#
+    dw LIT,0, LIT,35, fcb$, PLUS, CSTORE     ; zero record extension
+    dw EXIT
+
+; read-file
+  head read$file,9,'read-file',docolon
+    dw LIT,33, ROT, ROT, file$io
+    dw DROP  ; ignore status
+    dw EXIT
+
+; write-file
+  head write$file,10,'write-file',docolon
+    dw LIT,40, ROT, ROT, file$io
+    dw DROP  ; ignore status    
+    dw EXIT
+
+
+; I know this is ugly, for now
+disk$buf    EQU 8000h
+
+; load - load and evaluate a block from the (open)
+;        block file.   Pretty bare-bones and expected
+;        to be replaced by a more sophisticated version
+;        from the FORTH environment extended after loading
+;
+;     HEX
+;     : LOAD (blocknum -- ) open-file 8000 read-file
+;       10 0 DO 8000 I 40 * + 40 2DUP CR BASE @ DECIMAL I . BASE ! 3E EMIT
+;       SPACE TYPE EVALUATE LOOP ;
+  head load$extend,4,'LOAD',docolon
+    DW open$file
+    DW LIT,disk$buf, read$file
+    DW LIT,10h, LIT,0, XDO
+LOAD1:
+    DW LIT,disk$buf, II
+    DW LIT,40h, STAR, PLUS
+    DW LIT,40h, TWODUP, CR
+    DW BASE, FETCH, DECIMAL, II, DOT, BASE, STORE
+    DW LIT,3Eh, EMIT
+    DW SPACE, TYPE, EVALUATE
+    DW XLOOP,LOAD1
+    DW EXIT
+
+; boot - load first two blocks from the blocks file to boostrap
+;        additional words into the forth environment.  The
+;        code in the first block can load additional blocks
+;        very carefully..
+  head bootextend,4,'INIT',docolon
+    DW LIT,0,load$extend, LIT,1,load$extend, EXIT

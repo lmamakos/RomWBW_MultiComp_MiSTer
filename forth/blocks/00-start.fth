@@ -1,0 +1,15 @@
+( 0 start.f  bootstrap words) HEX   10 CONSTANT BYTES/LINE 
+: BOUNDS ( addr len -- addr2 addr1 ) OVER + SWAP ;
+: .ASCII ( adr n --) BOUNDS DO I C@ DUP 
+    80 1F WITHIN IF DROP [CHAR] . THEN EMIT LOOP ;
+: .####   ( n --) 0 <#  # # # #  #> TYPE ;
+: .dumpbytes BOUNDS DO  SPACE I C@ 0 <# # # #> TYPE LOOP ;
+: .dumpwords BOUNDS DO  SPACE I @ .####  2 +LOOP ;
+: (DUMP)  ROT ROT BOUNDS BASE @ >R HEX DO
+   CR  I  .####  [CHAR] : EMIT DUP
+   I BYTES/LINE ROT EXECUTE  SPACE SPACE
+   I BYTES/LINE .ASCII BYTES/LINE +LOOP  DROP CR R> BASE ! ;
+: DUMP ['] .dumpbytes (DUMP) ;  : DUMPW ['] .dumpwords (DUMP) ;
+: PARSE >R SOURCE  >IN @ OVER MIN /STRING OVER SWAP R>  SCAN >R
+   OVER - DUP R> IF 1+ THEN  >IN +! ;
+: \ 1 PARSE 2DROP ; IMMEDIATE   : .( 29 PARSE TYPE ; IMMEDIATE
