@@ -237,36 +237,45 @@ addressptr:
 ;   is streamed through the auto-incrementing data port with INIR (each
 ;   INIR moves up to 256 bytes; we loop for larger counts).
   head rdtomem,6,'RD>MEM',docode
-	; Register/stack model on entry (Forth TOS is in BC):
-	;   BC          = count
-	;   (sp)+0      = c-addr   (destination, popped first)
-	;   (sp)+2      = phys-hi
-	;   (sp)+4      = phys-lo
-	; We must consume all four cells and refill BC with the new TOS.
-	ld h,b
-	ld l,c			; hl = count
-	pop de			; de = c-addr (destination)
-	pop bc			; bc = phys-hi
-	ex (sp),hl		; (sp) <- count ; hl <- phys-lo
-	; now: hl = phys-lo, bc = phys-hi, de = dest, (sp) = count
-	push bc			; save phys-hi
+	; Register conventions: DE (IP), IX (RSP), IY (UP) MUST be preserved.
+	; All scratch work is done in the alternate register set (like FILL and
+	; CMOVE) so the main DE=IP is never touched.  SP is not banked, so the
+	; POPs below still take cells off the parameter stack.
+	;
+	; Stack model on entry (Forth TOS is in main BC):
+	;   BC       = count
+	;   (sp)+0   = c-addr   (destination, popped first)
+	;   (sp)+2   = phys-hi
+	;   (sp)+4   = phys-lo
+	push bc			; TOS(count) -> param stack
+	exx			; alternate set now active; main DE=IP preserved
+	; alt stack (SP shared) top-down: count, c-addr, phys-hi, phys-lo, ...
+	pop bc			; bc' = count
+	pop hl			; hl' = c-addr (destination pointer for INIR)
+	; set the 32-bit MMU pointer from the next two cells (phys-hi, phys-lo).
+	; phys-hi is on top now, phys-lo below it.
+	pop de			; de' = phys-hi
+	ex (sp),hl		; (sp) <- c-addr(dest) ; hl' <- phys-lo
+	; now: hl'=phys-lo, de'=phys-hi, bc'=count, (sp)=dest, DE(main)=IP
+	push bc			; save count (machine stack)
 	ld c,MMUP0
 	out (c),l		; +0  bits  7:0
 	inc c
 	out (c),h		; +1  bits 15:8
-	pop hl			; hl = phys-hi
 	inc c
-	out (c),l		; +2  bits 23:16
+	out (c),e		; +2  bits 23:16
 	inc c
-	out (c),h		; +3  bits 31:24
-	pop hl			; hl = count (restored)
-	ex de,hl		; de = count, hl = dest pointer
-	; stream 'de' bytes from MMUDAT into (hl); 256-byte chunks via INIR
+	out (c),d		; +3  bits 31:24
+	pop bc			; bc' = count (restored)
+	pop hl			; hl' = dest pointer (restored)
+	; stream 'bc' bytes from MMUDAT into (hl'); 256-byte chunks via INIR
+	ld d,b			; d' = count high (whole-256 chunk counter)
+	ld e,c			; e' = count low  (final partial count)
 	ld c,MMUDAT
 rdmem1:	ld a,d			; whole 256-byte chunks remaining?
 	or a
 	jr z,rdmem2		; none: do the final partial chunk
-	ld b,0			; b=0 => INIR transfers 256 bytes
+	ld b,0			; b'=0 => INIR transfers 256 bytes
 	inir
 	dec d
 	jr rdmem1
@@ -275,7 +284,8 @@ rdmem2:	ld a,e			; low byte = remaining bytes (0..255)
 	jr z,rdmem3
 	ld b,e
 	inir
-rdmem3:	pop bc			; refill Forth TOS with the new top cell
+rdmem3:	exx			; back to the main register set (DE=IP intact)
+	pop bc			; refill Forth TOS with the new top cell
 	next
 
 ; MEM>RD ( phys-lo phys-hi c-addr count -- )
@@ -284,31 +294,33 @@ rdmem3:	pop bc			; refill Forth TOS with the new top cell
 ;   using the MMU direct-access window.  Same pointer set-up as RD>MEM, then
 ;   the data is streamed to the auto-incrementing data port with OTIR.
   head memtord,6,'MEM>RD',docode
-	; identical stack model to RD>MEM (TOS in BC = count):
+	; Same alternate-register-set discipline as RD>MEM; DE=IP preserved.
+	; Stack model on entry (Forth TOS in main BC = count):
 	;   (sp)+0 = c-addr (source)   (sp)+2 = phys-hi   (sp)+4 = phys-lo
-	ld h,b
-	ld l,c			; hl = count
-	pop de			; de = c-addr (source)
-	pop bc			; bc = phys-hi
-	ex (sp),hl		; (sp) <- count ; hl <- phys-lo
-	push bc			; save phys-hi
+	push bc			; TOS(count) -> param stack
+	exx			; alternate set active; main DE=IP preserved
+	pop bc			; bc' = count
+	pop hl			; hl' = c-addr (source pointer for OTIR)
+	pop de			; de' = phys-hi
+	ex (sp),hl		; (sp) <- c-addr(src) ; hl' <- phys-lo
+	push bc			; save count
 	ld c,MMUP0
 	out (c),l		; +0  bits  7:0
 	inc c
 	out (c),h		; +1  bits 15:8
-	pop hl			; hl = phys-hi
 	inc c
-	out (c),l		; +2  bits 23:16
+	out (c),e		; +2  bits 23:16
 	inc c
-	out (c),h		; +3  bits 31:24
-	pop hl			; hl = count (restored)
-	ex de,hl		; de = count, hl = source pointer
-	; stream 'de' bytes from (hl) to MMUDAT; 256-byte chunks via OTIR
+	out (c),d		; +3  bits 31:24
+	pop bc			; bc' = count (restored)
+	pop hl			; hl' = source pointer (restored)
+	ld d,b			; d' = count high (whole-256 chunk counter)
+	ld e,c			; e' = count low  (final partial count)
 	ld c,MMUDAT
 wrmem1:	ld a,d			; whole 256-byte chunks remaining?
 	or a
 	jr z,wrmem2		; none: do the final partial chunk
-	ld b,0			; b=0 => OTIR transfers 256 bytes
+	ld b,0			; b'=0 => OTIR transfers 256 bytes
 	otir
 	dec d
 	jr wrmem1
@@ -317,7 +329,8 @@ wrmem2:	ld a,e			; low byte = remaining bytes (0..255)
 	jr z,wrmem3
 	ld b,e
 	otir
-wrmem3:	pop bc			; refill Forth TOS with the new top cell
+wrmem3:	exx			; back to the main register set (DE=IP intact)
+	pop bc			; refill Forth TOS with the new top cell
 	next
 
 ; >PHYS ( blk# -- phys-lo phys-hi )
@@ -327,15 +340,20 @@ wrmem3:	pop bc			; refill Forth TOS with the new top cell
 ;   fed straight into RD>MEM.  32-bit math done here in assembly because
 ;   the kernel has no D+ .
   head tophys,5,'>PHYS',docode
-	; BC = blk#.  Compute blk#*1024 into DE:HL (hi:lo).
+	; Register conventions: DE (IP) MUST be preserved.  The 32-bit multiply
+	; uses DE as a scratch accumulator, so do it in the alternate set.
+	; ( blk# -- phys-lo phys-hi ) : main BC = blk# (TOS) on entry.
+	push bc			; blk# -> param stack
+	exx			; alternate set active; main DE=IP preserved
+	pop bc			; bc' = blk#
 	ld h,b
-	ld l,c			; hl = blk#
-	ld de,0			; de = high word accumulator
-	; multiply by 1024 = shift left 10 bits, propagating into DE
+	ld l,c			; hl' = blk#
+	ld de,0			; de' = high word accumulator
+	; multiply by 1024 = shift left 10 bits, propagating into DE'
 	ld a,10
-phys1:	add hl,hl		; hl <<= 1
+phys1:	add hl,hl		; hl' <<= 1
 	ex de,hl
-	adc hl,hl		; de <<= 1 with carry in from hl
+	adc hl,hl		; de' <<= 1 with carry in from hl'
 	ex de,hl
 	dec a
 	jr nz,phys1
@@ -346,10 +364,11 @@ phys1:	add hl,hl		; hl <<= 1
 	ld bc,RDBASEHI
 	adc hl,bc		; high word + base high + carry
 	ex de,hl
-	; hl = phys-lo, de = phys-hi.  Push phys-lo, leave phys-hi in TOS.
-	push hl			; phys-lo -> stack
-	ld b,d
-	ld c,e			; TOS = phys-hi
+	; hl' = phys-lo, de' = phys-hi.
+	push hl			; phys-lo -> param stack
+	push de			; phys-hi -> param stack (becomes new TOS)
+	exx			; back to main set (DE=IP intact)
+	pop bc			; main BC = phys-hi (new TOS)
 	next
 
 ; -------------------------------------------------------------------
