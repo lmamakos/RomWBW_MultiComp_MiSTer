@@ -498,7 +498,7 @@ fpChain : entity work.Transparent_Capture_Chain
 -- mode through ports +5/+6.
 fpSubsys : entity work.FrontPanel_Subsystem
 	generic map (
-		NUM_LEDS => 16,
+		NUM_LEDS => 64,
 		SYS_CLK  => 50000000
 	)
 	port map (

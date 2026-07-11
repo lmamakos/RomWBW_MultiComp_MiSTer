@@ -1036,7 +1036,7 @@ DOTS2:  DW EXIT
         DW LIT,80h,COUNT,INTERPRET
     ENDIF
         DW XSQUOTE
-        DB 45,00Dh,0Ah,'Z80 CamelForth v1.02 02 Mar 1995 for CP/M'
+        DB 45,00Dh,0Ah,'Z80 CamelForth v1.02 2026-07-10a for CP/M'
         DB 0dh,0ah
         DW TYPE,ABORT       ; ABORT never returns
 	DW XSQUOTE

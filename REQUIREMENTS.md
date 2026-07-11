@@ -1353,11 +1353,13 @@ widening work, for whoever picks it up next.
 - Incidental Quartus housekeeping churn (`MultiComp.qsf`, `build_id.v`)
   remains uncommitted by design.
 
-### Suggested next steps (priority order)
+## Suggested next steps (priority order)
 
 1. **Implement "RAM Disk" access inside of Camel FORTH. 
 2. **Front-panel hardware bring-up** (outstanding item 2) — the subsystem
-   is wired but never lit on real hardware.
+   is wired but never lit on real hardware.  THe subsystem needs to be
+   modified to shift data out starting with the most significant bit (MSB)
+   first. 
 3. **MMU reset map** (item 4) — decide on a sensible default beyond the
    placeholder identity map now that SDRAM is real.
 4. **Legacy memory cleanup** (item 7) — remove dead `externalRam` /

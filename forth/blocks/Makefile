@@ -20,8 +20,8 @@ EDITOR   = 09-editor.blk 10-editor.blk 11-editor.blk 12-editor.blk 13-editor.blk
 SEE      = 21-see.blk 22-see.blk 23-see.blk 24-see.blk 
 
 blks=      00-start.blk 01-utils.blk 02-blocks.blk 03-blocks.blk 04-blocks.blk \
-           ${LINEEDIT} 08-case.blk  ${EDITOR} ${SEE}  \
-           blank.blk  blank.blk  blank.blk  blank.blk  blank.blk \
+           ${LINEEDIT} 08-case.blk  ${EDITOR} ${SEE} 25-mmu.blk \
+           blank.blk  blank.blk  blank.blk  blank.blk \
            30-bench.blk
 
 forth.blk: blank.blk $(blks) Makefile
