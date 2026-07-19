@@ -168,39 +168,41 @@ redefined to emit the opcode and the FORTH test suite re-run.
 correct bit timing and the correct total bit count, but every bit is 0 —
 no LED ever lights.
 
-**Root-cause note (bit ordering).** This is *not* about the WS2812 PHY
-shift direction inside `FrontPanel_Subsystem.vhd` (which already shifts
-each 24-bit color MSB-first, matching the WS2812 protocol). The suspect is
-upstream of that: the **capture-chain** components
-(`Transparent_Capture_Chain.vhd`, `Universal_Capture_Chain.vhd`) that feed
-`FrontPanel_Subsystem` currently shift their `combined_data` input out
-**LSB-first** (`chain_out <= shift_reg(0)`, new bits entering at the top).
-For a source such as the 8-bit port-0x47 latch, this means bit 0 of that
-register is clocked out first and bit 7 last — backwards from what a
-physical LED-strip layout wants: the **MSB of an 8-bit source register
-should be clocked out (and therefore reach the first LED in the chain)
-first**, so the chain order matches left-to-right register-bit order on a
-future PCB layout. Fix the shift order in both capture-chain variants (and
-confirm the fix against the existing `mapping.mif`/identity-map
-assumptions used for bring-up).
+**Fixed in HDL, hardware re-verification pending:**
 
-**Requirement — simplify before re-testing.** Independent of the bit-order
-fix, the current design's per-LED gradual fade between programmable ON and
-OFF colors (`alpha_ram` ramp, `MATH_INIT`/`MATH_CHANNEL`/`MATH_BRIGHT` in
-`FrontPanel_Subsystem.vhd`) adds significant state-machine complexity that
-is not needed to establish basic functionality. Strip this down to a
-minimal path — capture-chain bit drives an LED directly to one of two fixed
-colors (or on/off) with no fade ramp and no per-channel interpolation — get
-that working and verified on hardware, and only then reintroduce fade/
-brightness/framebuffer features incrementally.
+- **Capture-chain bit order.** The root-cause suspect was *not* the WS2812
+  PHY shift direction inside `FrontPanel_Subsystem.vhd` (which already
+  shifted each 24-bit color MSB-first, matching the WS2812 protocol), but
+  the **capture-chain** components (`Transparent_Capture_Chain.vhd`,
+  `Universal_Capture_Chain.vhd`) that feed it, which shifted their
+  `combined_data` input out LSB-first — backwards from what a physical
+  LED-strip layout wants. Both variants now shift `combined_data` out
+  **MSB-first** (`chain_out <= shift_reg(TOTAL_WIDTH-1)`, with a matching
+  left-shift), so an 8-bit source register's MSB reaches the first LED in
+  the chain, matching left-to-right register-bit order under the default
+  identity `mapping.mif`.
+- **Colour path simplified.** The per-LED gradual fade between
+  programmable ON/OFF colors (`alpha_ram` ramp, `MATH_INIT`/
+  `MATH_CHANNEL`/`MATH_BRIGHT` in `FrontPanel_Subsystem.vhd`) has been
+  removed. Each LED now shows its RAM-stored on/off color directly and
+  instantly, selected by the existing mapping-table/framebuffer logic
+  (unchanged, fully retained). Global-brightness (`+0`) and fade-rate
+  (`+1`) registers remain stored/readable for compatibility but currently
+  have no effect; reintroduce fade/brightness incrementally once basic
+  LED output is confirmed on hardware.
+
+Both changes analyze/elaborate cleanly under GHDL `--std=08`. **Still
+needed:** re-test on real hardware to confirm LEDs actually light; if they
+still don't, the fault is elsewhere (PHY output enable, USER_IO pin
+routing/muxing, or the WS2812 power/data wiring itself).
 
 **Also fix while in this code:** `MultiComp.sv` currently declares
 `user_fpLED_serial` from `USER_OUT[4]` (a stale comment/declaration left
 over from before the LED output was moved to a different pin) and
 separately drives it via `assign ... USER_OUT[6]` — a leftover duplicate/
-conflicting driver from the pin-swap commit. Clean this up as part of the
-simplification so there is a single, correctly-commented signal path from
-`FrontPanel_Subsystem` to the physical pin.
+conflicting driver from the pin-swap commit. Clean this up so there is a
+single, correctly-commented signal path from `FrontPanel_Subsystem` to the
+physical pin.
 
 ## Next milestone: RomWBW port
 
