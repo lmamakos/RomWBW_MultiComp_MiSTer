@@ -96,8 +96,8 @@ shift accordingly.
 
 | Port  | R/W | Function                                                                                  |
 |-------|-----|-------------------------------------------------------------------------------------------|
-| `0xA0`| R/W | Global brightness (0..255, 8-bit linear scale).                                           |
-| `0xA1`| R/W | Fade rate (step per refresh tick).                                                        |
+| `0xA0`| R/W | Global brightness (0..255). Stored/readable but currently has no effect on LED output (fade/brightness math removed for bring-up — see `Components/FRONTPANEL/README.md`). |
+| `0xA1`| R/W | Fade rate (step per refresh tick). Stored/readable but currently has no effect (as above). |
 | `0xA2`| R/W | Global pointer (LED index used by `0xA3`, `0xA5`, `0xA6`).                                |
 | `0xA3`| W   | Colour stream. Six bytes per LED: on-G, on-R, on-B, off-G, off-R, off-B. The sixth byte auto-advances the global pointer.|
 | `0xA4`| R/W | Mode register. Bit 0: 0 = mirror capture chain, 1 = framebuffer.                          |

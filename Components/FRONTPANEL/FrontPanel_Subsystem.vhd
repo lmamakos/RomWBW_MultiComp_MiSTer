@@ -2,9 +2,20 @@
 -- FrontPanel_Subsystem
 --
 -- Top level of the front-panel LED subsystem. Owns the Z-80 I/O port
--- decoder, the dual-port LED-state RAMs, the per-LED interpolation /
--- brightness math, and the WS2812/SK6812 PHY that shifts the final
--- pixel data out on a single GPIO pin.
+-- decoder, the dual-port LED-state RAMs (colour, chain-bit mapping,
+-- framebuffer), and the WS2812/SK6812 PHY that shifts the final pixel
+-- data out on a single GPIO pin.
+--
+-- SIMPLIFIED FOR INITIAL BRING-UP: each LED shows its RAM-stored "on"
+-- colour or "off" colour directly, selected by the mapped chain bit
+-- (or framebuffer bit) for that LED -- an instant switch, with no
+-- gradual fade between the two colours and no brightness/interpolation
+-- math. The mapping table (+5) and framebuffer (+4/+6) are unchanged
+-- and fully functional. The global-brightness (+0) and fade-rate (+1)
+-- registers are still readable/writable for software compatibility but
+-- have no effect on the LED output in this configuration; they are
+-- reserved for the fade/brightness reintroduction once basic output is
+-- confirmed on hardware. See REQUIREMENTS.md / HISTORY.md for context.
 --
 -- Clocking: a single clk (frequency = SYS_CLK Hz) clocks everything.
 -- The PHY bit-time constants are derived from SYS_CLK so the WS2812
@@ -13,8 +24,8 @@
 -- I/O register map (8 consecutive ports, aligned on a multiple-of-8
 -- boundary, decoded relative to the io_cs chip-select input that the
 -- external decoder drives):
---   +0   R/W  global brightness (0..255, 8-bit linear scale)
---   +1   R/W  fade rate (0..255, step per refresh tick)
+--   +0   R/W  global brightness -- stored, currently unused (reserved)
+--   +1   R/W  fade rate -- stored, currently unused (reserved)
 --   +2   R/W  global pointer (LED index for +3, +5, +6)
 --   +3   W    colour stream: 6 bytes per LED (on-G, on-R, on-B,
 --                    off-G, off-R, off-B); auto-advances pointer.
@@ -98,29 +109,16 @@ architecture rtl of FrontPanel_Subsystem is
     signal r_fb_b   : std_logic;
 
     -- Master Controller State Machine
-    type state_t is (IDLE, LATCH_ST, SHADOW_SHIFT, FETCH_MEM, WAIT_MEM, MATH_INIT, MATH_CHANNEL, MATH_BRIGHT, SEND_PHY);
+    type state_t is (IDLE, LATCH_ST, SHADOW_SHIFT, FETCH_MEM, WAIT_MEM, SEND_PHY);
     signal state : state_t := IDLE;
 
     signal bit_counter : integer range 0 to NUM_LEDS-1 := 0;
     signal shadow_reg  : std_logic_vector(NUM_LEDS-1 downto 0);
 
-    -- Alpha RAM (Internal MLAB)
-    type alpha_mem_t is array (0 to NUM_LEDS-1) of unsigned(7 downto 0);
-    signal alpha_ram : alpha_mem_t := (others => x"00");
-    attribute ramstyle : string;
-    attribute ramstyle of alpha_ram : signal is "MLAB";
-
-    -- DSP / Math Engine Signals
-    signal cur_alpha  : unsigned(7 downto 0);
-    signal target_bit : std_logic;
-    signal mult_op1, mult_op2 : signed(8 downto 0);
-    -- 9 x 9 -> 18-bit signed product. Only bits 15:8 are consumed
-    -- downstream (interpolation step and brightness scaling); bits
-    -- 17:16 are sign-extension and bits 7:0 are sub-byte precision.
-    signal product            : signed(17 downto 0);
-    signal interp_rgb         : unsigned(23 downto 0);
-    signal final_rgb          : std_logic_vector(23 downto 0);
-    signal ch_idx             : integer range 0 to 2 := 0;
+    -- Colour selected for the LED currently at ctrl_idx: r_col_b's
+    -- "on" half or "off" half, verbatim (both are already stored in
+    -- the GRB byte order the PHY expects -- see colors.mif).
+    signal final_rgb : std_logic_vector(23 downto 0);
 
     -- PHY Signals
     signal phy_start, phy_busy : std_logic := '0';
@@ -201,29 +199,22 @@ begin
         end if;
     end process;
 
-    -- 3. Master Controller & Math Engine
-    product <= mult_op1 * mult_op2; -- Shared DSP Multiplier
-
+    -- 3. Master Controller
     process(clk, reset)
-        variable on_val, off_val : unsigned(7 downto 0);
-        variable step_res : signed(8 downto 0);
+        -- Mirror-chain vs framebuffer select, computed locally so it's
+        -- available combinationally within the same cycle it's used
+        -- (avoids an extra state/cycle per LED).
+        variable want_on : std_logic;
     begin
         if reset = '1' then
             state       <= IDLE;
             bit_counter <= 0;
             ctrl_idx    <= (others => '0');
             shadow_reg  <= (others => '0');
-            ch_idx      <= 0;
-            target_bit  <= '0';
-            cur_alpha   <= (others => '0');
-            mult_op1    <= (others => '0');
-            mult_op2    <= (others => '0');
-            interp_rgb  <= (others => '0');
             final_rgb   <= (others => '0');
             latch       <= '0';
             shift_en    <= '0';
             phy_start   <= '0';
-            -- alpha_ram is left to its declared initial value (others => x"00").
         elsif rising_edge(clk) then
             latch <= '0'; shift_en <= '0'; phy_start <= '0';
 
@@ -250,55 +241,19 @@ begin
                     state <= WAIT_MEM;
 
                 when WAIT_MEM =>
-                    cur_alpha <= alpha_ram(to_integer(ctrl_idx));
-                    state <= MATH_INIT;
+                    -- r_col_b/r_map_b/r_fb_b are now valid. Pick this
+                    -- LED's target state (mirror captured chain bit,
+                    -- via the mapping table, or framebuffer bit) and
+                    -- drive its stored on/off colour straight through
+                    -- -- no fade ramp, no interpolation, no brightness
+                    -- scaling.
+                    if mode_reg = '0' then want_on := shadow_reg(to_integer(r_map_b));
+                    else want_on := r_fb_b; end if;
 
-                when MATH_INIT =>
-                    -- Select Target Bit (Mirror vs Software Mode)
-                    if mode_reg = '0' then target_bit <= shadow_reg(to_integer(r_map_b));
-                    else target_bit <= r_fb_b; end if;
+                    if want_on = '1' then final_rgb <= r_col_b(47 downto 24); -- on colour (G,R,B)
+                    else final_rgb <= r_col_b(23 downto 0); end if;           -- off colour (G,R,B)
 
-                    -- Alpha Fade Logic
-                    if target_bit = '1' then
-                        if cur_alpha <= (255 - fade_rate) then alpha_ram(to_integer(ctrl_idx)) <= cur_alpha + fade_rate;
-                        else alpha_ram(to_integer(ctrl_idx)) <= x"FF"; end if;
-                    else
-                        if cur_alpha >= fade_rate then alpha_ram(to_integer(ctrl_idx)) <= cur_alpha - fade_rate;
-                        else alpha_ram(to_integer(ctrl_idx)) <= x"00"; end if;
-                    end if;
-
-                    ch_idx <= 0; state <= MATH_CHANNEL;
-
-                when MATH_CHANNEL =>
-                    -- Interpolation: Off + ((On-Off)*Alpha)/256
-                    case ch_idx is
-                        when 0 => on_val := unsigned(r_col_b(47 downto 40)); off_val := unsigned(r_col_b(23 downto 16));
-                        when 1 => on_val := unsigned(r_col_b(39 downto 32)); off_val := unsigned(r_col_b(15 downto 8));
-                        when 2 => on_val := unsigned(r_col_b(31 downto 24)); off_val := unsigned(r_col_b(7 downto 0));
-                    end case;
-
-                    mult_op1 <= signed('0' & on_val) - signed('0' & off_val);
-                    mult_op2 <= signed('0' & cur_alpha);
-
-                    step_res := signed('0' & off_val) + product(15 downto 8);
-                    interp_rgb( (2-ch_idx)*8+7 downto (2-ch_idx)*8 ) <= unsigned(step_res(7 downto 0));
-
-                    if ch_idx = 2 then state <= MATH_BRIGHT; ch_idx <= 0;
-                    else ch_idx <= ch_idx + 1; end if;
-
-                when MATH_BRIGHT =>
-                    -- Brightness Scaling
-                    case ch_idx is
-                        when 0 => mult_op1 <= signed('0' & interp_rgb(23 downto 16));
-                        when 1 => mult_op1 <= signed('0' & interp_rgb(15 downto 8));
-                        when 2 => mult_op1 <= signed('0' & interp_rgb(7 downto 0));
-                    end case;
-                    mult_op2 <= signed('0' & global_bright);
-
-                    final_rgb( (2-ch_idx)*8+7 downto (2-ch_idx)*8 ) <= std_logic_vector(product(15 downto 8));
-
-                    if ch_idx = 2 then state <= SEND_PHY;
-                    else ch_idx <= ch_idx + 1; end if;
+                    state <= SEND_PHY;
 
                 when SEND_PHY =>
                     if phy_busy = '0' then

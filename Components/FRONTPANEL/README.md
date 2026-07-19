@@ -1,19 +1,38 @@
 # Front Panel Interface
 
-> **Status (2026-05):** Initial integration done. The front-panel
-> subsystem is now wired into the `MicrocomputerZ80CPM` core with a
-> single 8-bit `Transparent_Capture_Chain` sourced from a new R/W
-> latch at I/O port 0x47, and the subsystem's 8-port control window
-> occupies I/O ports 0xA0..0xA7. The WS2812 serial line emerges on
-> `USER_OUT[4]` of the MiSTer USER_IO port. The two new VHDL files
-> (`FP_RAM_Store`, `Transparent_Capture_Chain`, `Universal_Capture_Chain`,
-> `FrontPanel_Subsystem`) are referenced from `MultiComp.qsf`. All four
-> files analyze cleanly under GHDL
-> VHDL-2008. The PHY timing tracks the `SYS_CLK` generic, the I/O
-> port-decoder process has a full reset clause, `STRETCH_MASK` is
-> explicitly width-checked, and the I/O port window is decoded
-> relative to an external `io_cs` chip-select (same pattern as the
-> MMU). Hardware bring-up not yet attempted.
+> **Status:** Wired into the `MicrocomputerZ80CPM` core with a single
+> 8-bit `Transparent_Capture_Chain` sourced from a R/W latch at I/O
+> port 0x47, and the subsystem's 8-port control window occupies I/O
+> ports 0xA0..0xA7. The WS2812 serial line emerges on `USER_OUT[6]` of
+> the MiSTer USER_IO port. On initial hardware bring-up the output
+> showed correct WS2812 bit timing/count but every bit was 0 (no LED
+> lit). Two changes have since been made to isolate the cause:
+>
+> 1. **Capture-chain bit order fixed.** `Transparent_Capture_Chain` and
+>    `Universal_Capture_Chain` previously shifted `combined_data` out
+>    **LSB-first**; combined with `FrontPanel_Subsystem`'s left-shift
+>    capture of the incoming serial stream, this bit-*reversed* an
+>    8-bit source register relative to physical LED order. Both chain
+>    variants now shift **MSB-first**, so (with the default identity
+>    `mapping.mif`) LED *i* mirrors bit *i* of an 8-bit source register
+>    directly — matching a natural left-to-right PCB layout — instead
+>    of the mirrored order.
+> 2. **Colour path simplified for bring-up.** `FrontPanel_Subsystem`'s
+>    per-LED fade ramp and on/off colour interpolation + brightness
+>    scaling (the `alpha_ram`/`MATH_INIT`/`MATH_CHANNEL`/`MATH_BRIGHT`
+>    machinery) have been removed for now. Each LED now shows its
+>    RAM-stored "on" or "off" colour directly and instantly, selected by
+>    the mapped chain bit (or framebuffer bit). This does not change the
+>    I/O port map, and the mapping table (`+5`) and framebuffer
+>    (`+4`/`+6`) are unchanged and fully functional; only the fade/
+>    interpolation/brightness stage was removed. The global-brightness
+>    (`+0`) and fade-rate (`+1`) registers are still stored and
+>    readable/writable but currently have no effect — they're reserved
+>    for reintroduction once basic LED output is confirmed on hardware.
+>
+> All four VHDL files (`FP_RAM_Store`, `Transparent_Capture_Chain`,
+> `Universal_Capture_Chain`, `FrontPanel_Subsystem`) continue to analyze
+> and elaborate cleanly under GHDL VHDL-2008. Re-verify on hardware next.
 
 ## Ultimate front panel light display
 
@@ -48,6 +67,9 @@ running on the Z-80 CPU by accessing some I/O ports.
 3. It should be possible to configure a gradual fade between the ON
 and OFF transition as well as the OFF to ON transition.  This would be
 used to simulate effecs such as the behavior of incandescent lamps.
+   > *(Temporarily removed — see Status above. The instant on/off
+   > switch is the current bring-up behavior; fade is to be
+   > reintroduced once basic LED output is confirmed on hardware.)*
 
 4. It should be possible to select some LEDs to capture brief ON
 conditions and stretch them so the brief ON state is visible to the
@@ -75,8 +97,8 @@ three low address bits are a clean offset into the window.
 
 | Offset | R/W | Function                                                       |
 |--------|-----|----------------------------------------------------------------|
-| +0     | R/W | Global brightness (0..255, 8-bit linear scale).                |
-| +1     | R/W | Fade rate (step per refresh tick).                             |
+| +0     | R/W | Global brightness (0..255). Stored/readable but **currently has no effect** — the brightness-scaling stage was removed for bring-up (see Status above). |
+| +1     | R/W | Fade rate (step per refresh tick). Stored/readable but **currently has no effect** — the fade-ramp stage was removed for bring-up (see Status above). |
 | +2     | R/W | Global pointer (LED index used by +3, +5, +6).                 |
 | +3     | W   | Colour stream. Six bytes per LED: on-G, on-R, on-B, off-G, off-R, off-B. On the sixth byte the global pointer advances by 1. |
 | +4     | R/W | Mode register (bit 0: 0 = mirror capture chain, 1 = framebuffer). |
@@ -89,6 +111,13 @@ three low address bits are a clean offset into the window.
 Two interoperable PISO capture components are provided. Both share the
 same `chain_in` / `chain_out` / `latch` / `shift_en` handshake, so any
 mix of them can be daisy-chained to form one logical chain.
+
+**Bit order:** both variants capture `combined_data` and shift it out
+**MSB-first** — bit `TOTAL_WIDTH-1` is captured/output first (right
+after `latch`), counting down to bit `0` last. For a source register
+this means its most-significant bit reaches the first LED position in
+the chain, matching left-to-right order on a physical PCB layout
+rather than a bit-reversed one.
 
 - **`Universal_Capture_Chain`** — supports both transparent and
   stretched bits in a single instance. `STRETCH_MASK` is a per-bit

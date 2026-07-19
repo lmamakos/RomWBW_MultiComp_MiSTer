@@ -27,10 +27,16 @@
 -- Handshake:
 --   * latch = '1'      Snap captured_bits into shift_reg.
 --   * shift_en = '1'   Advance shift_reg one bit, importing chain_in
---                      into the high end and exporting bit 0 as
---                      chain_out.
+--                      into the low end and exporting the current
+--                      MSB (bit TOTAL_WIDTH-1) as chain_out.
 -- latch and shift_en are not expected to be asserted simultaneously
 -- by the controller; if they are, latch takes priority.
+--
+-- Bit order: combined_data's MSB (bit TOTAL_WIDTH-1) is captured and
+-- output FIRST, immediately after latch, followed by TOTAL_WIDTH-2,
+-- TOTAL_WIDTH-3, ... down to bit 0 last -- matching
+-- Transparent_Capture_Chain so the two interleave consistently in one
+-- logical chain.
 --
 -- The STRETCH_MASK generic is declared unconstrained but an
 -- elaboration-time assertion enforces that its length equals
@@ -143,11 +149,14 @@ begin
                 -- Snap the current state of captured_bits (raw or stretched)
                 shift_reg <= captured_bits;
             elsif shift_en = '1' then
-                shift_reg <= chain_in & shift_reg(TOTAL_WIDTH-1 downto 1);
+                -- Shift left: the MSB (already exported via chain_out)
+                -- drops off the top, everything else moves up one
+                -- position, and chain_in enters at the bottom.
+                shift_reg <= shift_reg(TOTAL_WIDTH-2 downto 0) & chain_in;
             end if;
         end if;
     end process;
 
-    chain_out <= shift_reg(0);
+    chain_out <= shift_reg(TOTAL_WIDTH-1);
 
 end architecture;

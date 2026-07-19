@@ -21,9 +21,16 @@
 -- Handshake (same semantics as Universal_Capture_Chain):
 --   * latch = '1'      Snap captured_bits into shift_reg.
 --   * shift_en = '1'   Advance shift_reg one bit, importing chain_in
---                      into the high end and exporting bit 0 as
---                      chain_out.
+--                      into the low end and exporting the current
+--                      MSB (bit TOTAL_WIDTH-1) as chain_out.
 -- latch takes priority over shift_en if both are asserted.
+--
+-- Bit order: combined_data's MSB (bit TOTAL_WIDTH-1) is captured and
+-- output FIRST, immediately after latch, followed by TOTAL_WIDTH-2,
+-- TOTAL_WIDTH-3, ... down to bit 0 last. This lets a source register's
+-- bit order correspond directly to physical LED order along the chain
+-- (LED 0 = MSB) rather than being bit-reversed, which better matches a
+-- left-to-right PCB layout.
 -- =====================================================================
 
 library ieee;
@@ -71,11 +78,14 @@ begin
             if latch = '1' then
                 shift_reg <= captured_bits;
             elsif shift_en = '1' then
-                shift_reg <= chain_in & shift_reg(TOTAL_WIDTH-1 downto 1);
+                -- Shift left: the MSB (already exported via chain_out)
+                -- drops off the top, everything else moves up one
+                -- position, and chain_in enters at the bottom.
+                shift_reg <= shift_reg(TOTAL_WIDTH-2 downto 0) & chain_in;
             end if;
         end if;
     end process;
 
-    chain_out <= shift_reg(0);
+    chain_out <= shift_reg(TOTAL_WIDTH-1);
 
 end architecture;
