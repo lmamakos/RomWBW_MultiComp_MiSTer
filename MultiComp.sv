@@ -727,11 +727,11 @@ assign UART_RTS = (serial_port_select || !flow_control_enable) ? 1'b1 : serial_r
 
 
 // USER_IO port control - single assignment for all outputs.
-// USER_OUT[4] carries the front-panel WS2812 single-wire serial line
+// USER_OUT[6] carries the front-panel WS2812 single-wire serial line
 
 assign USER_OUT = {
-    2'b0,                                                              // [6:5] unused
-    fpLED_serial,                                                      // [4] front-panel WS2812 data
+    fpLED_serial,                                                      // [6] front-panel WS2812 data
+    2'b0,                                                              // [5:4] unused
     serial_port_select && flow_control_enable,                         // [3] CTS input enable
     (serial_port_select && flow_control_enable) ? serial_rts : 1'b1,   // [2] RTS output
     serial_port_select ? serial_tx : 1'b1,                             // [1] TX output
@@ -743,7 +743,7 @@ assign user_rx_en 	= USER_OUT[0];
 assign user_tx 		= USER_OUT[1];
 assign user_rts 	= USER_OUT[2];
 assign user_cts_en 	= USER_OUT[3];
-assign user_fpLED_serial = USER_OUT[4];
+assign user_fpLED_serial = USER_OUT[6];
    
 ///////////////////////////////////////////////////
 
