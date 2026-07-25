@@ -50,7 +50,33 @@ There are **no active conditional compilation macros** in the current build.
 
 ## Build commands
 
-No Makefile or build script exists. Build via Quartus:
+### Using the build wrapper scripts (recommended)
+
+Two wrapper scripts in `tools/` simplify remote Quartus invocation via SSH+Docker on `tycho`:
+
+```sh
+# Full build (analysis, synthesis, place & route):
+tools/build.sh
+
+# Synthesis only (skip place & route):
+tools/build.sh synth
+
+# Show help:
+tools/build.sh help
+
+# Custom quartus_sh arguments:
+tools/quartus_build.sh --flow compile_synthesis MultiComp -c MultiComp
+```
+
+**How it works:**
+- Both scripts detect the project root automatically (by finding `MultiComp.qpf`/`MultiComp.qsf`).
+- `tools/quartus_build.sh`: low-level wrapper that SSH's to `tycho`, runs Docker with Quartus 17.0, and passes all arguments directly to `quartus_sh`.
+- `tools/build.sh`: high-level convenience wrapper with common targets (`full`, `synth`, `help`).
+- The Docker container mounts the local project directory as `/build`, so output files are written back to the local `output_files/MultiComp.rbf`.
+
+### Manual build via Quartus GUI/CLI (advanced)
+
+If you have Quartus installed locally:
 
 ```sh
 # GUI: open MultiComp.qpf, Process → Start Compilation
@@ -60,9 +86,8 @@ quartus_sh --flow compile MultiComp -c MultiComp
 
 Output: `output_files/MultiComp.rbf`.
 
-Building the HDL core happens externally as the Quartus tool environment
-is in a development container and invoked manually as needed to perform
-synthesis for testing or production.
+**Note:** Building the HDL core typically happens via the wrapper scripts above, which invoke
+a containerized Quartus environment on `tycho` to avoid local tool dependencies.
 
 ## Target device
 

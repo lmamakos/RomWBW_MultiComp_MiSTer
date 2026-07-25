@@ -2,16 +2,17 @@
 # quartus_build.sh — wrapper script to invoke Quartus compilation via SSH+Docker on tycho
 #
 # Usage:
-#   ./quartus_build.sh [quartus_sh options]
+#   tools/quartus_build.sh [quartus_sh options]
+#   (or ./tools/quartus_build.sh if in the project root)
 #
 # Examples:
-#   ./quartus_build.sh --flow compile MultiComp -c MultiComp
+#   tools/quartus_build.sh --flow compile MultiComp -c MultiComp
 #     (builds the entire project)
 #
-#   ./quartus_build.sh --flow compile_synthesis MultiComp -c MultiComp
+#   tools/quartus_build.sh --flow compile_synthesis MultiComp -c MultiComp
 #     (runs only analysis & synthesis, skipping place & route)
 #
-#   ./quartus_build.sh -t MultiComp
+#   tools/quartus_build.sh -t MultiComp
 #     (queries current timing for the compiled design)
 #
 # Environment:
@@ -21,20 +22,34 @@
 #   - Mounts current directory into /build inside the container
 #
 # Notes:
-#   - The working directory for this script should be the project root
-#     (where MultiComp.qpf and MultiComp.qsf reside).
+#   - This script can be run from the project root or from any subdirectory within it
+#     (it will traverse up to find MultiComp.qpf and MultiComp.qsf).
 #   - All output files are written back to the local project directory
 #     after the container exits.
 #   - This script requires SSH access to 'tycho' and Docker to be installed/configured there.
 
 set -euo pipefail
 
-# Validate we're in the project root
-if [[ ! -f "MultiComp.qpf" || ! -f "MultiComp.qsf" ]]; then
-    echo "Error: MultiComp.qpf and MultiComp.qsf not found in current directory."
-    echo "Please run this script from the project root directory."
+# Find the project root by traversing up from the script's location
+find_project_root() {
+    local dir="$(cd "$(dirname "$0")" && pwd)"
+    while [[ "$dir" != "/" ]]; do
+        if [[ -f "$dir/MultiComp.qpf" && -f "$dir/MultiComp.qsf" ]]; then
+            echo "$dir"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    return 1
+}
+
+PROJECT_ROOT=$(find_project_root) || {
+    echo "Error: Could not find project root (MultiComp.qpf and MultiComp.qsf)."
+    echo "Please ensure this script is run from within the project directory tree."
     exit 1
-fi
+}
+
+cd "$PROJECT_ROOT"
 
 # Build the full command to be executed on tycho
 # The script passes all arguments to quartus_sh
