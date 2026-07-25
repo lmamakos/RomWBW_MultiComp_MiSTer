@@ -12,8 +12,6 @@ system to run on this core in the future.
   `sys_top` via MiSTer's standard interface. Not the top-level entity.
 - **CPU cores** under `Components/` (Z80 via T80 VHD).
   Machine selection is done via OSD, wired through `MultiComp.sv`.  
-- **ROMs** are pre-initialized VHDL arrays under `ROMS/`. To modify a ROM,
-  regenerate the `.vhd` from the `.hex` source.
 
 ## Quartus revision
 
@@ -21,8 +19,7 @@ system to run on this core in the future.
 in `MultiComp.qsf` (USB support, Z80, SignalTap enabled, aggressive
 optimization settings).
 
-(A second `MultiComp-lite` revision previously existed but was removed as
-stale.) Run Analysis & Synthesis after changing `.qsf` assignments.
+Run Analysis & Synthesis after changing `.qsf` assignments.
 
 ## How to add HDL source files
 
@@ -63,6 +60,10 @@ quartus_sh --flow compile MultiComp -c MultiComp
 
 Output: `output_files/MultiComp.rbf`.
 
+Building the HDL core happens externally as the Quartus tool environment
+is in a development container and invoked manually as needed to perform
+synthesis for testing or production.
+
 ## Target device
 
 Cyclone V `5CSEBA6U23I7` (DE10-Nano / MiSTer).
@@ -75,7 +76,8 @@ Cyclone V `5CSEBA6U23I7` (DE10-Nano / MiSTer).
   Regenerate via MegaWizard; do not hand-edit `.v` files in these dirs.
 - **No automated tests exist.** Verification is done by compiling and running
   on hardware or in ModelSim.
-- **The `*.qsf~` file** is a stale backup; ignore it.
+- **The `*.qsf~` file** and other files with a `~` suffix are a stale editor
+  backup files; ignore them.
 - When adding pins, add both the `set_location_assignment` and
   `set_instance_assignment` IO standard, matching the pattern of existing
   entries in the `.qsf`.
