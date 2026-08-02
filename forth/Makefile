@@ -18,6 +18,10 @@ clean:
 all:
 	cd blocks; make
 
+install:	camel80.bin
+	scp camel80.bin       mister:/media/fat/games/MultiComp/camel80.bin
+	scp blocks/forth.blk  mister:/media/fat/games/MultiComp/forth.blk
+
 cpm: blocks/forth.blk
 	@echo make sure to remove all the *.AZM and *.SUB files from the CP/M disk image
 	cpmcp -t -f ${CPMFORMAT}  ${CPMDISK}  camel80.azm    ${CPMDEST}camel80.azm
@@ -29,7 +33,7 @@ cpm: blocks/forth.blk
 	cpmcp    -f ${CPMFORMAT}  ${CPMDISK}  blocks/forth.blk   ${CPMDEST}forth.blk
 	@echo "Now ^C in CP/M to login disk and then build"
 
-install: blocks/forth.blk
+cpminstall: blocks/forth.blk
 	cpmcp    -f ${CPMFORMAT}  ${CPMDISK}  blocks/forth.blk   ${CPMDEST}forth.blk
 
 fetchcpm:

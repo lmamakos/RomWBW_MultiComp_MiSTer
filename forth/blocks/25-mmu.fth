@@ -14,4 +14,3 @@ HEX 0B0 CONSTANT mmu-base    1E00 CONSTANT ram-disk-page
 : ramdisk.io 0000 0780 ( low high ) mmu.io ;
 : dumprd ramdisk.io 1000 0 DO I 3F AND 0= IF CR THEN
   0BC PC@ EMIT LOOP CR ;
-
