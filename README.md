@@ -5,8 +5,31 @@ Port of Grant Searle's MultiComp to the MiSTer.
 
 Ported by Cyril Venditti and Fred VanEijk.
 
-Updated by S0urceror to use MiSTer image files, use all 4 machine types and have the MiSTer
-UART connected to serial interface 2 of the core. The latter allows to use the core remotely.
+Updated by S0urceror to use MiSTer image files, use all 4 machine
+types and have the MiSTer UART connected to serial interface 2 of the
+core. The latter allows to use the core remotely.
+
+## Port to RomWBW
+
+Started the process of porting this core to execute the RomWBW
+environment.  This requires adding an MMU to access banked switched
+memory segments are needed by RomWBW.  This also has the other
+non-Z-80 CPUs removed from the FPGA core as these are not compatible
+with the Z-80 specific RomWBW environment.
+
+## Front Panel
+
+A design exists for a maximum blinenlights front panel display, in the
+spirit of the IMSAI 8080 computer system, but with more LEDs.  As this
+is an FPGA based system, we have access to much more internal state of
+the CPU and system that can be brought out to LEDs for display.
+
+The working target is to support 256 LEDs, each of which are WS2812
+type addressable RGB LEDs.  This enables, for example, the
+simultaenous display of the state of _all_ of the Z-80 CPU registers.
+
+These LEDs would be updated at an approximately 60-100 Hz refresh
+rate.
 
 ## Using the MiSTer Serial Terminal/Console
 
