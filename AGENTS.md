@@ -12,7 +12,10 @@ system to run on this core in the future.
   `sys_top` via MiSTer's standard interface. Not the top-level entity.
 - **CPU cores** under `Components/` (Z80 via T80 VHD).
   Machine selection is done via OSD, wired through `MultiComp.sv`.  
-
+- Project development occurs in a Linux environment.  When editing files,
+  use only LF (line feed) characters for end of line; do not insert
+  carriage return 0x0D characters.
+  
 ## Quartus revision
 
 `MultiComp.qpf` defines a single revision, `MultiComp`, with its settings
