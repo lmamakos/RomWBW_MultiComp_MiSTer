@@ -1,15 +1,16 @@
-( L0                                                           )
-HEX 47 CONSTANT fpleds
-: delay 200 0 DO I I DROP DROP LOOP ;
+( 26 Front Panel LED debugging stuff                           )
+HEX 0FF CONSTANT fpleds 0A2 CONSTANT fpptr  0A3 CONSTANT fprgb
+0A4 CONSTANT fpmode 0A6 CONSTANT fpbit  0A0 CONSTANT fpdim
+40 CONSTANT NLED  : delay 200 0 DO I I DROP DROP LOOP ;
 : counter 100 0 DO I fpleds PC! delay LOOP ;
-DECIMAL
 : times ( xt n -- )  0 DO DUP EXECUTE LOOP DROP ;
 : 5count ['] counter 5 times ;
-( L7                                                           )
-( L8                                                           )
-( L9                                                           )
-( L10                                                          )
-( L11                                                          )
-( L12                                                          )
-( L13                                                          )
-( L14                                                          )
+: sel fpptr PC! ;
+: setcolors ( pl -- ) fpptr PC!  50 fprgb PC! 00 fprgb PC!
+  00 fprgb PC!  00 fprgb PC! 00 fprgb PC! 10 fprgb PC! ;
+: on fpptr PC! 1 fpbit PC! ;  : off fpptr PC! 0 fpbit PC! ;
+: mode0 0 fpmode PC! ;  : mode1 1 fpmode PC! ;
+: clear NLED 0 DO I fpptr PC!  I setcolors I off LOOP ;
+: chase  NLED 0 DO I on  I 1- 3F AND off delay LOOP ;
+: fancy chase mode0 ['] delay 20 times mode1 ;
+( L15                                                          )
