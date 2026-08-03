@@ -222,8 +222,8 @@ wire user_rx_en   = USER_OUT[0];    // Enable RX input
 wire user_tx      = USER_OUT[1];    // Serial TX to USER_IO port
 wire user_rts     = USER_OUT[2];    // RTS to USER_IO port
 wire user_cts_en  = USER_OUT[3];    // Enable CTS input
-wire user_fpLED_serial = USER_OUT[4]; // front panel LED string
-// USER_OUT[5:6] unused
+// USER_OUT[4..5] unused
+wire user_fpLED_serial = USER_OUT[6]; // front panel LED string
 
 assign ADC_BUS  = 'Z;
 //assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;

@@ -60,7 +60,7 @@ entity MicrocomputerZ80CPM is
 		-- usbSCLK			: out std_logic;
 
 		-- Front-panel WS2812/SK6812 single-wire serial output. Initial
-		-- integration: 8 bits latched from I/O port 0x47 drive an 8-bit
+		-- integration: 8 bits latched from I/O port 0xFF drive an 8-bit
 		-- transparent capture chain into the FrontPanel_Subsystem,
 		-- which then shifts a single-wire colour stream out to the LED
 		-- string.
@@ -142,7 +142,7 @@ architecture struct of MicrocomputerZ80CPM is
 	signal n_interface1CS			: std_logic :='1';
 	signal n_interface2CS			: std_logic :='1';
 	signal n_sdCardCS				: std_logic :='1';
-	signal n_fpLatchCS				: std_logic :='1';   -- I/O port 0x47 latch
+	signal n_fpLatchCS				: std_logic :='1';   -- I/O port 0xFF latch
 	signal n_fpSubsysCS				: std_logic :='1';   -- FrontPanel_Subsystem 8-port window at 0xA0..0xA7
 	signal n_mmuCS					: std_logic :='1';   -- MMU 16-port window at 0xB0..0xBF
 
@@ -216,6 +216,8 @@ architecture struct of MicrocomputerZ80CPM is
 	signal fpChainSerial			: std_logic;
 	signal fpChainLatch				: std_logic;
 	signal fpChainShiftEn			: std_logic;
+        signal fpChainEndOut : std_logic;
+        signal fpChainStatic : std_logic;
 
 	signal serialClkCount				: unsigned(15 downto 0);
 	signal cpuClkCount				: std_logic_vector(5 downto 0); 
@@ -441,7 +443,7 @@ port map(
 -- ____________________________________________________________________________________
 -- FRONT PANEL GOES HERE
 
--- Port 0x47: 8-bit R/W latch. Software writes set the bit pattern
+-- Port 0xFF: 8-bit R/W latch. Software writes set the bit pattern
 -- driven onto the front-panel transparent capture chain. Reads return
 -- the last-written value.
 process(clk)
@@ -476,6 +478,7 @@ begin
 	end if;
 end process;
 
+-- **** LED 0 - 7
 -- 8-bit transparent capture chain sourced from the fpLatch register.
 fpChain : entity work.Transparent_Capture_Chain
 	generic map (
@@ -487,12 +490,42 @@ fpChain : entity work.Transparent_Capture_Chain
 		latch         => fpChainLatch,
 		shift_en      => fpChainShiftEn,
 		combined_data => fpLatch,
-		chain_in      => '0',
+		chain_in      => fpChainStatic,
 		chain_out     => fpChainSerial
 	);
 
+-- **** LED 8 - 31
+fpChainStaticTest : entity work.Transparent_Capture_Chain
+	generic map (
+		TOTAL_WIDTH => 24
+	)
+	port map (
+		clk           => clk,
+		reset         => not N_RESET,
+		latch         => fpChainLatch,
+		shift_en      => fpChainShiftEn,
+		combined_data => cpuAddress & cpuDataIn,
+		chain_in      => fpChainEndOut,
+		chain_out     => fpChainStatic
+	);
+
+-- **** LED 32 - 63
+fpChainEnd :  entity work.Transparent_Capture_Chain
+	generic map (
+		TOTAL_WIDTH => 32
+	)
+	port map (
+		clk           => clk,
+		reset         => not N_RESET,
+		latch         => fpChainLatch,
+		shift_en      => fpChainShiftEn,
+		combined_data => x"000000" & fpLatch,
+		chain_in      => '0',
+		chain_out     => fpChainEndOut
+	);
+  
 -- Front-panel controller. The 8-port window lives at $A0..$A7 in the
--- Z-80 I/O space (n_fpSubsysCS). NUM_LEDS is set to 16 for the initial
+-- Z-80 I/O space (n_fpSubsysCS). NUM_LEDS is set to 64 for the initial
 -- bring-up so the entire string is reachable by the default identity
 -- mapping while leaving headroom to test the software framebuffer
 -- mode through ports +5/+6.
@@ -540,7 +573,7 @@ n_basRomCS <= '0' when cpuAddress(15 downto 13) = "000" and n_memRD='0' and n_Ro
 n_interface1CS <= '0' when cpuAddress(7 downto 1) = "1000000" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 2 Bytes $80-$81
 n_interface2CS <= '0' when cpuAddress(7 downto 1) = "1000001" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 2 Bytes $82-$83
 n_sdCardCS <= '0' when cpuAddress(7 downto 3) = "10001" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 8 Bytes $88-$8F
-n_fpLatchCS <= '0' when cpuAddress(7 downto 0) = x"47" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 1 Byte $47 (front-panel data latch)
+n_fpLatchCS <= '0' when cpuAddress(7 downto 0) = x"FF" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 1 Byte $FF (front-panel data latch)
 n_fpSubsysCS <= '0' when cpuAddress(7 downto 3) = "10100" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 8 Bytes $A0-$A7 (front-panel subsystem)
 n_mmuCS <= '0' when cpuAddress(7 downto 4) = "1011" and (n_ioWR='0' or n_ioRD = '0') else '1'; -- 16 Bytes $B0-$BF (MMU)
 
