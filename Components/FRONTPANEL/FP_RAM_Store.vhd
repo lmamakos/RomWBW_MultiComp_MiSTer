@@ -59,7 +59,7 @@ architecture rtl of FP_RAM_Store is
     -- quirk of the physical LEDs is never visible to software.
     -- Default: on = bright green (R=0x01,G=0xFF,B=0x01), off = dim
     -- green (R=0x01,G=0x10,B=0x01).
-    constant DEFAULT_COLOR : std_logic_vector(47 downto 0) := x"01FF01011001";
+    constant DEFAULT_COLOR : std_logic_vector(47 downto 0) := x"FF0001000009";
 
     type color_mem_t is array (0 to NUM_LEDS-1) of std_logic_vector(47 downto 0);
     signal color_ram : color_mem_t;

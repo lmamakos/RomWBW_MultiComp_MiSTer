@@ -240,7 +240,7 @@ begin
         if reset = '1' then
             global_ptr <= (others => '0');
             sub_ptr <= 0;
-            global_bright <= x"80";
+            global_bright <= x"40"; -- need to revisit this with real hardware
             fade_rate <= x"08";
             mode_reg <= '0';
             color_buf <= (others => '0');
@@ -368,7 +368,6 @@ begin
 
                 when SHADOW_SHIFT =>
                     shift_en <= '1';
-                    -- shadow_reg <= shadow_reg(NUM_LEDS-2 downto 0) & chain_in;
                     shadow_reg <= chain_in & shadow_reg(NUM_LEDS-1 downto 1);
                     if bit_counter = NUM_LEDS-1 then
                         ctrl_idx <= (others => '0'); state <= FETCH_MEM;
@@ -394,17 +393,14 @@ begin
                     -- No fade ramp/interpolation between on and off.
                     if mode_reg = '0' then
                       want_on := shadow_reg(to_integer(r_map_b));
-                      -- want_on := shadow_reg(to_integer(ctrl_idx)); -- WORKAROUND (bypasses mapping RAM): restore the line above and comment this one to re-test with r_map_b disabled.
                     else
                       want_on := r_fb_b;
                     end if;
 
                     if want_on = '1' then
                       sel_rgb <= r_col_b(47 downto 24); -- on colour (R,G,B)
-                      -- sel_rgb <= x"024000"; -- WORKAROUND (bypasses colour RAM): restore the two lines below and comment out the real assignments above to re-test with r_col_b disabled.
                     else
                       sel_rgb <= r_col_b(23 downto 0);  -- off colour (R,G,B)
-                      -- sel_rgb <= x"000002";
                     end if;
 
                     state <= SCALE_BRIGHT;
