@@ -6,6 +6,18 @@ entity FP_RAM_Store is
     generic ( NUM_LEDS : integer := 256 );
     port (
         clk           : in  std_logic;
+        -- Synchronous reset. In addition to the usual meaning, this
+        -- also (re-)triggers the post-reset RAM initialization
+        -- sequence below, so color_ram/map_ram/fb_ram come back to a
+        -- known, reproducible state every time the Z-80 system
+        -- resets, not just once at FPGA power-up.
+        reset         : in  std_logic;
+        -- '0' while the post-reset initialization sequence is
+        -- running (see below), '1' once color_ram/map_ram/fb_ram are
+        -- known-good. Consumers should hold off reading Port B until
+        -- this is asserted.
+        init_done     : out std_logic;
+
         -- Port A: Z80 Access (Read/Write)
         addr_a        : in  unsigned(7 downto 0);
         we_color      : in  std_logic;
@@ -16,7 +28,7 @@ entity FP_RAM_Store is
         din_fb        : in  std_logic;
         dout_map      : out unsigned(7 downto 0);
         dout_fb       : out std_logic;
-        
+
         -- Port B: Controller Access (Read Only)
         addr_b        : in  unsigned(7 downto 0);
         dout_color_b  : out std_logic_vector(47 downto 0);
@@ -27,64 +39,73 @@ end entity;
 
 architecture rtl of FP_RAM_Store is
     attribute ramstyle : string;
-    attribute ram_init_file : string;
 
-    -- NOTE on initial content: `ram_init_file` is a Quartus-only
-    -- synthesis attribute that preloads the M10K/MLAB block at
-    -- bitstream configuration time; it has no effect in a plain VHDL
-    -- simulator (GHDL, or ModelSim without an Altera-specific preload
-    -- flow), which will otherwise see these signals as uninitialized
-    -- ('U') until the first write. Both RAMs below therefore also
-    -- carry an explicit VHDL default value matching the corresponding
-    -- .mif's documented reset content, so behavioural simulation and
-    -- the real FPGA power-up state agree. fb_ram already had such a
-    -- default (it has no .mif at all) -- these two are brought in
-    -- line with it.
+    -- Default reset content for color_ram/map_ram/fb_ram. Applied by
+    -- the init sequencer below, which runs for NUM_LEDS clk cycles
+    -- immediately after every reset (not just at FPGA power-up),
+    -- since a real M10K/MLAB block has no synchronous "clear every
+    -- location" input. This is the single, authoritative source for
+    -- the RAMs' default content; there is no external .mif file (see
+    -- HISTORY.md/REQUIREMENTS.md for why: Quartus was found to prefer
+    -- a VHDL default over `ram_init_file` whenever both are present,
+    -- making a separate .mif redundant and easy to let drift out of
+    -- sync).
     --
-    -- IMPORTANT (confirmed via a Quartus 17.0 build, see
-    -- output_files/MultiComp.fit.rpt): once a signal has BOTH a VHDL
-    -- default value and a `ram_init_file` attribute, Quartus prefers
-    -- the VHDL default -- it auto-derives its own internal
-    -- db/*.hdl.mif from the default value and does not reference
-    -- colors.mif/mapping.mif at all. In other words, colors.mif and
-    -- mapping.mif are no longer the active source of the RAM's reset
-    -- content; the VHDL default values immediately below are. Keep
-    -- them in sync manually if you edit one; colors.mif/mapping.mif
-    -- are kept only as documentation of the intended default and as a
-    -- template for a future runtime-loadable content scheme.
+    -- Colours are stored here in R,G,B byte order -- matching the
+    -- software-facing +3 colour-stream port exactly. The GRB reorder
+    -- needed for the WS2812/SK6812 wire protocol happens only in
+    -- FrontPanel_Subsystem, immediately before the PHY, so this
+    -- storage format and the +3 write format agree and the GRB
+    -- quirk of the physical LEDs is never visible to software.
+    -- Default: on = bright green (R=0x01,G=0xFF,B=0x01), off = dim
+    -- green (R=0x01,G=0x10,B=0x01).
+    constant DEFAULT_COLOR : std_logic_vector(47 downto 0) := x"01FF01011001";
+
     type color_mem_t is array (0 to NUM_LEDS-1) of std_logic_vector(47 downto 0);
-    -- Matches colors.mif: on = 0xFF0101 (bright green), off = 0x100101 (dim green).
-    signal color_ram : color_mem_t := (others => x"FF0101100101");
+    signal color_ram : color_mem_t;
     attribute ramstyle of color_ram : signal is "M10K";
-    attribute ram_init_file of color_ram : signal is "colors.mif";
 
     type map_mem_t is array (0 to NUM_LEDS-1) of unsigned(7 downto 0);
-    -- Matches mapping.mif: identity map, entry i -> chain bit i.
-    function init_identity_map return map_mem_t is
-        variable result : map_mem_t;
-    begin
-        for i in map_mem_t'range loop
-            result(i) := to_unsigned(i, 8);
-        end loop;
-        return result;
-    end function;
-    signal map_ram : map_mem_t := init_identity_map;
+    signal map_ram : map_mem_t;
     attribute ramstyle of map_ram : signal is "MLAB";
-    attribute ram_init_file of map_ram : signal is "mapping.mif";
 
     type fb_mem_t is array (0 to NUM_LEDS-1) of std_logic;
-    signal fb_ram : fb_mem_t := (others => '0');
+    signal fb_ram : fb_mem_t;
     attribute ramstyle of fb_ram : signal is "MLAB";
 
+    -- Post-reset RAM initialization sequencer: steps init_addr from 0
+    -- to NUM_LEDS-1, writing DEFAULT_COLOR / an identity map entry /
+    -- '0' into every location. init_done is held low for the
+    -- NUM_LEDS clk cycles this takes.
+    signal init_active : std_logic := '1';
+    signal init_addr    : unsigned(7 downto 0) := (others => '0');
+
 begin
-    -- Port A: Z-80 Interface
+    init_done <= not init_active;
+
+    -- Port A: Z-80 Interface. Also owns the post-reset init
+    -- sequencer, since it's the only writer of these arrays.
     process(clk)
     begin
         if rising_edge(clk) then
-            if we_color = '1' then color_ram(to_integer(addr_a)) <= din_color; end if;
-            if we_map = '1'   then map_ram(to_integer(addr_a))   <= din_map;   end if;
-            if we_fb = '1'    then fb_ram(to_integer(addr_a))    <= din_fb;    end if;
-            
+            if reset = '1' then
+                init_active <= '1';
+                init_addr   <= (others => '0');
+            elsif init_active = '1' then
+                color_ram(to_integer(init_addr)) <= DEFAULT_COLOR;
+                map_ram(to_integer(init_addr))   <= init_addr;
+                fb_ram(to_integer(init_addr))    <= '0';
+                if init_addr = NUM_LEDS-1 then
+                    init_active <= '0';
+                else
+                    init_addr <= init_addr + 1;
+                end if;
+            else
+                if we_color = '1' then color_ram(to_integer(addr_a)) <= din_color; end if;
+                if we_map = '1'   then map_ram(to_integer(addr_a))   <= din_map;   end if;
+                if we_fb = '1'    then fb_ram(to_integer(addr_a))    <= din_fb;    end if;
+            end if;
+
             dout_map <= map_ram(to_integer(addr_a));
             dout_fb  <= fb_ram(to_integer(addr_a));
         end if;

@@ -13,10 +13,10 @@
 >    **LSB-first**; combined with `FrontPanel_Subsystem`'s left-shift
 >    capture of the incoming serial stream, this bit-*reversed* an
 >    8-bit source register relative to physical LED order. Both chain
->    variants now shift **MSB-first**, so (with the default identity
->    `mapping.mif`) LED *i* mirrors bit *i* of an 8-bit source register
->    directly — matching a natural left-to-right PCB layout — instead
->    of the mirrored order.
+> variants now shift **MSB-first**, so (with the default identity
+> mapping -- see `FP_RAM_Store.vhd`) LED *i* mirrors bit *i* of an
+> 8-bit source register directly — matching a natural left-to-right
+> PCB layout — instead of the mirrored order.
 > 2. **Colour path simplified for bring-up.** `FrontPanel_Subsystem`'s
 >    per-LED fade ramp and on/off colour interpolation + brightness
 >    scaling (the `alpha_ram`/`MATH_INIT`/`MATH_CHANNEL`/`MATH_BRIGHT`
@@ -30,7 +30,7 @@
 >    readable/writable but currently have no effect — they're reserved
 >    for reintroduction once basic LED output is confirmed on hardware.
 >
-> Two further bugs were found and fixed after that first bring-up pass:
+> Several further bugs were found and fixed after that first bring-up pass:
 >
 > 3. **Z-80 I/O decoder no longer re-triggers on every `clk` edge.**
 >    `clk` runs far faster than the Z-80's own (divided-down) clock, so
@@ -50,16 +50,63 @@
 >    entirely (confirmed absent from the fitter report) and to collapse
 >    `map_ram`'s dead second read port. The real RAM-backed logic is
 >    restored (the old hardcoded literals are left commented out for
->    easy A/B testing). Both `color_ram` and `map_ram` also gained an
->    explicit VHDL default value (previously only `fb_ram` had one),
->    matching their `.mif`s' documented intent, so GHDL/non-Quartus
->    simulation sees sane content instead of `'U'`. A fresh Quartus
->    build confirms `color_ram` is now a real 64×48 M10K block.
+>    easy A/B testing). A fresh Quartus build confirms `color_ram` is
+>    now a real 64×48 M10K block.
+> 5. **RAM contents now re-initialize on every reset, not just once at
+>    power-up.** `color_ram`/`map_ram`/`fb_ram` previously relied solely
+>    on a Quartus-only `ram_init_file` attribute (which a plain VHDL
+>    simulator like GHDL never honours) or a VHDL default value (which
+>    only applies once, at elaboration/power-up, not on a later reset
+>    pulse). `FP_RAM_Store` now has its own small init sequencer that
+>    steps through every address writing the default content (identity
+>    map, a visible default on/off colour, framebuffer all off) for
+>    `NUM_LEDS` `clk` cycles every time `reset` is asserted, and exposes
+>    `init_done` so `FrontPanel_Subsystem`'s Master Controller can hold
+>    off starting the first refresh until it's finished. `colors.mif`/
+>    `mapping.mif` are no longer used (also removed; see point 6) --
+>    the defaults now live solely in `FP_RAM_Store.vhd`.
+> 6. **Colour interface changed from GRB to RGB, hidden GRB reorder.**
+>    The `+3` colour-stream port and `color_ram`'s storage format used
+>    to match the WS2812/SK6812 wire's native G,R,B byte order, forcing
+>    software to think in GRB. Storage and the `+3` port are now plain
+>    R,G,B (matching how every other colour API works); the GRB reorder
+>    the LEDs actually need happens only in the new `SCALE_BRIGHT` state,
+>    immediately before the PHY, so it's entirely invisible to software.
+> 7. **Global brightness (`+0`) re-implemented.** Removed during the
+>    initial bring-up simplification (point 2 above) along with the
+>    fade ramp, brightness scaling is back as a single extra pipeline
+>    state (`SCALE_BRIGHT`) that scales each of the selected colour's
+>    three channels independently by `global_bright` using the standard
+>    8-bit "scale8" convention (`scaled = (channel * global_bright) /
+>    256`; matches e.g. FastLED's `scale8()`). `global_bright = 0xFF` is
+>    ~full brightness, `0x00` forces the LED fully off. The fade-rate
+>    (`+1`) register remains stored/readable but inert; gradual fade
+>    *between* on and off is still future work.
+> 8. **Two write-path correctness bugs found and fixed while adding the
+>    above:**
+>    - The `+3`/`+5`/`+6` pointer auto-increment updated `global_ptr` in
+>      the *same* cycle as the write commit (`we_col`/`we_map`/`we_fb`),
+>      but `FP_RAM_Store`'s actual RAM write only takes effect one
+>      cross-entity `clk` edge later -- by which point `global_ptr` (and
+>      hence `addr_a`) had already advanced, so every auto-incrementing
+>      write silently landed one slot ahead of where it should have.
+>      Fixed by deferring the pointer update by one extra cycle
+>      (`pending_incr`) so `FP_RAM_Store` still sees the original
+>      address at the moment it actually commits the write.
+>    - `global_ptr` could be driven past `NUM_LEDS-1` (e.g. by streaming
+>      exactly `NUM_LEDS` accesses through `+5`/`+6`), which is an
+>      out-of-bounds array index for `color_ram`/`map_ram`/`fb_ram` --
+>      undefined in synthesis and a hard simulation failure under GHDL.
+>      The auto-increment now wraps at `NUM_LEDS` back to 0.
 >
 > All four VHDL files (`FP_RAM_Store`, `Transparent_Capture_Chain`,
 > `Universal_Capture_Chain`, `FrontPanel_Subsystem`) continue to analyze
 > and elaborate cleanly under GHDL VHDL-2008, and a full Quartus 17.0
-> build completes with 0 errors. Re-verify on hardware next.
+> build completes with 0 errors. Points 5-8 above were verified with a
+> dedicated GHDL testbench covering: RAM defaults after both the first
+> and a *second* reset, a `+3`/`+5`/`+6` write landing at the correct
+> (pre-increment) address, the RGB-in/GRB-out colour path, and
+> brightness scaling at full/half/zero. Re-verify hardware next.
 
 ## Ultimate front panel light display
 
@@ -124,14 +171,16 @@ three low address bits are a clean offset into the window.
 
 | Offset | R/W | Function                                                       |
 |--------|-----|----------------------------------------------------------------|
-| +0     | R/W | Global brightness (0..255). Stored/readable but **currently has no effect** — the brightness-scaling stage was removed for bring-up (see Status above). |
+| +0     | R/W | Global brightness (0..255, "scale8" style: 0xFF ~= full brightness, 0x00 = fully off). Applied to every channel of whichever colour is selected for display; see Status above. |
 | +1     | R/W | Fade rate (step per refresh tick). Stored/readable but **currently has no effect** — the fade-ramp stage was removed for bring-up (see Status above). |
 | +2     | R/W | Global pointer (LED index used by +3, +5, +6).                 |
-| +3     | W   | Colour stream. Six bytes per LED: on-G, on-R, on-B, off-G, off-R, off-B. On the sixth byte the global pointer advances by 1. |
+| +3     | W   | Colour stream, R,G,B order (matches the LEDs' own on-wire GRB order internally, but never exposed to software -- see Status above). Six bytes per LED: on-R, on-G, on-B, off-R, off-G, off-B. On the sixth byte the global pointer advances by 1. |
 | +4     | R/W | Mode register (bit 0: 0 = mirror capture chain, 1 = framebuffer). |
 | +5     | R/W | Mapping-table entry at the global pointer. Both reads and writes auto-advance the pointer by 1. |
 | +6     | R/W | Framebuffer bit at the global pointer. Both reads and writes auto-advance the pointer. |
 | +7     | --  | Reserved (reads 0, writes ignored).                            |
+
+The `+3`/`+5`/`+6` pointer auto-advance wraps at `NUM_LEDS` back to 0 rather than growing past it, so streaming exactly `NUM_LEDS` (or a multiple of it) accesses through any of those ports is always well-defined.
 
 ## Capture-chain variants
 

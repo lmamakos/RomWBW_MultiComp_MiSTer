@@ -69,12 +69,12 @@ Entries should be kept in sync with the `n_*CS` decodes in the
 | Port(s)       | Width | Function                                                                                                  |
 |---------------|-------|-----------------------------------------------------------------------------------------------------------|
 | `0x38`        | 1     | ROM-disable trigger. Any write disables the boot ROM at `0x0000-0x1FFF` and exposes the RAM beneath it.   |
-| `0x47`        | 1     | Front-panel data latch (R/W). Software writes drive the 8-bit transparent capture chain; reads return the last-written value. |
 | `0x80`-`0x81` | 2     | SBCTextDisplayRGB (`n_interface1CS`). VGA/PS-2 text display.                                              |
 | `0x82`-`0x83` | 2     | bufferedUART (`n_interface2CS`). Serial console.                                                          |
 | `0x88`-`0x8F` | 8     | SD card controller (`n_sdCardCS`). Register offset via `cpuAddress(2 downto 0)`.                          |
 | `0xA0`-`0xA7` | 8     | Front-panel subsystem control window (`n_fpSubsysCS`). See Front-panel I/O register map below.            |
 | `0xB0`-`0xBF` | 16    | MMU register window (`n_mmuCS`). 4 frame-mapping low bytes at `+0..+3` (Z2-compatible), 4 high bytes at `+4..+7`, direct-access pointer at `+8..+11` (little-endian), direct-access data port at `+12`. |
+| `0xFF`        | 1     | Front-panel data latch (R/W). Software writes drive the 8-bit transparent capture chain; reads return the last-written value. |
 
 ### MMU I/O register window detail
 16 consecutive ports, decoded relative to `io_cs` on the low 4 address bits, `0xB0` - `0xBF`:
@@ -96,10 +96,10 @@ shift accordingly.
 
 | Port  | R/W | Function                                                                                  |
 |-------|-----|-------------------------------------------------------------------------------------------|
-| `0xA0`| R/W | Global brightness (0..255). Stored/readable but currently has no effect on LED output (fade/brightness math removed for bring-up — see `Components/FRONTPANEL/README.md`). |
-| `0xA1`| R/W | Fade rate (step per refresh tick). Stored/readable but currently has no effect (as above). |
-| `0xA2`| R/W | Global pointer (LED index used by `0xA3`, `0xA5`, `0xA6`).                                |
-| `0xA3`| W   | Colour stream. Six bytes per LED: on-G, on-R, on-B, off-G, off-R, off-B. The sixth byte auto-advances the global pointer.|
+| `0xA0`| R/W | Global brightness (0..255, "scale8" style: 0xFF ~= full brightness, 0x00 = fully off). Applied to every channel of the selected colour -- see `Components/FRONTPANEL/README.md`. |
+| `0xA1`| R/W | Fade rate (step per refresh tick). Stored/readable but currently has no effect (fade-ramp math removed for bring-up — see `Components/FRONTPANEL/README.md`). |
+| `0xA2`| R/W | Global pointer (LED index used by `0xA3`, `0xA5`, `0xA6`). Auto-advance on `0xA3`/`0xA5`/`0xA6` wraps at `NUM_LEDS` back to 0. |
+| `0xA3`| W   | Colour stream, R,G,B order (not the LEDs' native GRB -- reordered internally, hidden from software). Six bytes per LED: on-R, on-G, on-B, off-R, off-G, off-B. The sixth byte auto-advances the global pointer.|
 | `0xA4`| R/W | Mode register. Bit 0: 0 = mirror capture chain, 1 = framebuffer.                          |
 | `0xA5`| R/W | Mapping-table entry at the global pointer. Both reads and writes auto-advance the pointer.|
 | `0xA6`| R/W | Framebuffer bit at the global pointer. Both reads and writes auto-advance the pointer.    |

@@ -7,34 +7,56 @@
 -- data out on a single GPIO pin.
 --
 -- SIMPLIFIED FOR INITIAL BRING-UP: each LED shows its RAM-stored "on"
--- colour or "off" colour directly, selected by the mapped chain bit
--- (or framebuffer bit) for that LED -- an instant switch, with no
--- gradual fade between the two colours and no brightness/interpolation
--- math. The mapping table (+5) and framebuffer (+4/+6) are unchanged
--- and fully functional. The global-brightness (+0) and fade-rate (+1)
--- registers are still readable/writable for software compatibility but
--- have no effect on the LED output in this configuration; they are
--- reserved for the fade/brightness reintroduction once basic output is
--- confirmed on hardware. See REQUIREMENTS.md / HISTORY.md for context.
+-- colour or "off" colour, scaled by the global brightness register,
+-- selected by the mapped chain bit (or framebuffer bit) for that LED
+-- -- an instant on/off switch, with no gradual fade *between* the two
+-- colours (the fade-rate (+1) register is stored/readable for
+-- software compatibility but has no effect; it is reserved for
+-- reintroduction once basic output is confirmed on hardware). The
+-- mapping table (+5) and framebuffer (+4/+6) are unchanged and fully
+-- functional, and the global-brightness (+0) register is fully active
+-- (see the SCALE_BRIGHT state below). See REQUIREMENTS.md / HISTORY.md
+-- for context.
 --
 -- Clocking: a single clk (frequency = SYS_CLK Hz) clocks everything.
 -- The PHY bit-time constants are derived from SYS_CLK so the WS2812
 -- 1.25 us bit period is preserved regardless of clock frequency.
 --
+-- Colour storage/interface: colours are stored in FP_RAM_Store, and
+-- streamed in/out over the +3 port, in plain R,G,B byte order. The
+-- WS2812/SK6812 wire protocol actually wants G,R,B order; that
+-- reorder happens only right before the PHY (see SCALE_BRIGHT below),
+-- so software never has to deal with the LEDs' GRB quirk.
+--
+-- Reset behaviour: FP_RAM_Store re-initializes color_ram/map_ram/
+-- fb_ram to known defaults (identity mapping, a visible default on/off
+-- colour, framebuffer all off) every time reset is asserted, not just
+-- once at FPGA power-up, so the front panel comes up in a reproducible
+-- state after every Z-80 reset. This takes NUM_LEDS clk cycles; the
+-- Master Controller (see IDLE state below) waits for it to finish
+-- before starting the first refresh.
+--
 -- I/O register map (8 consecutive ports, aligned on a multiple-of-8
 -- boundary, decoded relative to the io_cs chip-select input that the
 -- external decoder drives):
---   +0   R/W  global brightness -- stored, currently unused (reserved)
+--   +0   R/W  global brightness (0..255, 8-bit linear scale applied to
+--              every channel of whichever colour -- on or off -- is
+--              selected for display; see SCALE_BRIGHT below).
 --   +1   R/W  fade rate -- stored, currently unused (reserved)
 --   +2   R/W  global pointer (LED index for +3, +5, +6)
---   +3   W    colour stream: 6 bytes per LED (on-G, on-R, on-B,
---                    off-G, off-R, off-B); auto-advances pointer.
+--   +3   W    colour stream: 6 bytes per LED (on-R, on-G, on-B,
+--                    off-R, off-G, off-B); auto-advances pointer.
 --   +4   R/W  mode register (bit 0: 0 = mirror chain, 1 = framebuffer)
 --   +5   R/W  mapping table entry at global_ptr (read or write
 --              auto-advances the pointer).
 --   +6   R/W  framebuffer bit at global_ptr (read or write
 --              auto-advances the pointer).
 --   +7   --   reserved (reads 0, writes ignored)
+--
+-- The pointer auto-advance on +3/+5/+6 wraps at NUM_LEDS back to 0
+-- (rather than growing past it), so streaming exactly NUM_LEDS (or an
+-- exact multiple of NUM_LEDS) accesses through any of those ports is
+-- always well-defined and lands back at LED 0.
 --
 -- This module looks only at the low 3 bits of addr to pick a register
 -- within the 8-port window. The integrator decides where the window
@@ -93,6 +115,15 @@ architecture rtl of FrontPanel_Subsystem is
 
     -- I/O Streaming Registers
     signal global_ptr    : unsigned(7 downto 0) := (others => '0');
+    -- Wraps global_ptr's auto-increment at NUM_LEDS instead of letting
+    -- it grow up to 255: without this, streaming exactly NUM_LEDS (or
+    -- more) accesses through +3/+5/+6 would push global_ptr past the
+    -- RAMs' valid 0..NUM_LEDS-1 index range -- undefined in synthesis
+    -- (address truncation behaviour depends on how many bits Quartus
+    -- actually implements) and a hard simulation failure under GHDL
+    -- (out-of-bounds array index). Wrapping here keeps pointer
+    -- behaviour well-defined and reproducible in both worlds.
+    signal global_ptr_next : unsigned(7 downto 0);
     signal sub_ptr       : integer range 0 to 5 := 0;
     signal global_bright : unsigned(7 downto 0) := x"80";
     signal fade_rate     : unsigned(7 downto 0) := x"08";
@@ -112,23 +143,36 @@ architecture rtl of FrontPanel_Subsystem is
 
     -- RAM Wrapper Interface
     signal we_col, we_map, we_fb : std_logic := '0';
+    -- Deferred write-side pointer increment (see the write-path case
+    -- statement below for why this can't just do
+    -- "global_ptr <= global_ptr_next" directly).
+    signal pending_incr : std_logic := '0';
     signal dout_map : unsigned(7 downto 0);
     signal dout_fb  : std_logic;
     signal ctrl_idx : unsigned(7 downto 0) := (others => '0');
     signal r_col_b  : std_logic_vector(47 downto 0);
     signal r_map_b  : unsigned(7 downto 0);
     signal r_fb_b   : std_logic;
+    -- '0' while FP_RAM_Store's post-reset RAM initialization sequence
+    -- is still running; the Master Controller waits for this before
+    -- starting the first refresh (see IDLE state below).
+    signal ram_init_done : std_logic;
 
     -- Master Controller State Machine
-    type state_t is (IDLE, LATCH_ST, SHADOW_SHIFT, FETCH_MEM, WAIT_MEM, WAIT_MEM2, SEND_PHY);
+    type state_t is (IDLE, LATCH_ST, SHADOW_SHIFT, FETCH_MEM, WAIT_MEM, WAIT_MEM2, SCALE_BRIGHT, SEND_PHY);
     signal state : state_t := IDLE;
 
     signal bit_counter : integer range 0 to NUM_LEDS-1 := 0;
     signal shadow_reg  : std_logic_vector(NUM_LEDS-1 downto 0);
 
     -- Colour selected for the LED currently at ctrl_idx: r_col_b's
-    -- "on" half or "off" half, verbatim (both are already stored in
-    -- the GRB byte order the PHY expects -- see colors.mif).
+    -- "on" half or "off" half, verbatim, in the R,G,B byte order it's
+    -- stored in (see FP_RAM_Store.vhd). Brightness-scaled and
+    -- reordered into the PHY's G,R,B wire order in SCALE_BRIGHT below.
+    signal sel_rgb : std_logic_vector(23 downto 0);
+
+    -- Final G,R,B value latched into the PHY shift register -- already
+    -- brightness-scaled and byte-reordered by SCALE_BRIGHT.
     signal final_rgb : std_logic_vector(23 downto 0);
 
     -- PHY Signals
@@ -143,6 +187,8 @@ begin
         generic map (NUM_LEDS => NUM_LEDS)
         port map (
             clk => clk,
+            reset => reset,
+            init_done => ram_init_done,
             addr_a => global_ptr,
             we_color => we_col, we_map => we_map, we_fb => we_fb,
             din_color => color_buf, din_map => unsigned(din), din_fb => din(0),
@@ -154,6 +200,10 @@ begin
     -- Bus-cycle-active levels, sampled combinationally every clk edge.
     write_active <= '1' when (io_cs = '1' and iorq_n = '0' and wr_n = '0') else '0';
     read_active  <= '1' when (io_cs = '1' and iorq_n = '0' and rd_n = '0') else '0';
+
+    -- global_ptr's auto-increment target, wrapped at NUM_LEDS (see
+    -- signal declaration above for why).
+    global_ptr_next <= (others => '0') when global_ptr = NUM_LEDS-1 else global_ptr + 1;
 
     -- One-cycle-delayed copies used for edge detection below.
     process(clk, reset)
@@ -197,6 +247,7 @@ begin
             we_col <= '0';
             we_map <= '0';
             we_fb <= '0';
+            pending_incr <= '0';
             dout <= (others => '0');
         elsif rising_edge(clk) then
             we_col <= '0'; we_map <= '0'; we_fb <= '0';
@@ -205,11 +256,36 @@ begin
             -- we drive zero so the bus consumer never sees stale data.
             dout <= x"00";
 
+            -- Apply a pointer increment requested by a write on the
+            -- *previous* cycle (see "pending_incr" below for why this
+            -- has to be deferred by one cycle rather than happening
+            -- in the same case statement that raises we_col/we_map/
+            -- we_fb).
+            pending_incr <= '0';
+            if pending_incr = '1' then
+                global_ptr <= global_ptr_next;
+            end if;
+
             -- Write path (single-shot, see wr_pulse above). Offsets
             -- within the 8-port window:
             --   +3 collects 6 colour bytes per LED before committing
             --      and advancing the pointer.
             --   +5 / +6 auto-advance the pointer on every write.
+            --
+            -- IMPORTANT: the pointer increment for +3/+5/+6 is
+            -- deferred by one cycle (via pending_incr, applied above)
+            -- rather than updating global_ptr directly here. addr_a on
+            -- FP_RAM_Store is wired straight to global_ptr, and
+            -- FP_RAM_Store's actual RAM write happens one clk edge
+            -- *after* we_col/we_map/we_fb become visible to it (the
+            -- usual cross-entity registered-signal handoff latency).
+            -- If global_ptr also advanced on this same edge, by the
+            -- time FP_RAM_Store's write fires it would see the
+            -- *already-incremented* address and write to the wrong
+            -- slot. Deferring the increment by one extra cycle keeps
+            -- global_ptr at its original value for the one cycle
+            -- FP_RAM_Store needs to see it, and still advances the
+            -- pointer in time for the next access.
             if wr_pulse = '1' then
                 case addr(2 downto 0) is
                     when "000" => global_bright <= unsigned(din);
@@ -218,11 +294,11 @@ begin
                     when "011" =>
                         color_buf <= color_buf(39 downto 0) & din;
                         if sub_ptr = 5 then
-                            we_col <= '1'; sub_ptr <= 0; global_ptr <= global_ptr + 1;
+                            we_col <= '1'; sub_ptr <= 0; pending_incr <= '1';
                         else sub_ptr <= sub_ptr + 1; end if;
                     when "100" => mode_reg <= din(0);
-                    when "101" => we_map <= '1'; global_ptr <= global_ptr + 1;
-                    when "110" => we_fb  <= '1'; global_ptr <= global_ptr + 1;
+                    when "101" => we_map <= '1'; pending_incr <= '1';
+                    when "110" => we_fb  <= '1'; pending_incr <= '1';
                     when others => null; -- +7 reserved
                 end case;
             end if;
@@ -248,8 +324,8 @@ begin
             -- contents out without managing the pointer manually.
             if rd_done_pulse = '1' then
                 case addr(2 downto 0) is
-                    when "101" => global_ptr <= global_ptr + 1;
-                    when "110" => global_ptr <= global_ptr + 1;
+                    when "101" => global_ptr <= global_ptr_next;
+                    when "110" => global_ptr <= global_ptr_next;
                     when others => null;
                 end case;
             end if;
@@ -262,6 +338,8 @@ begin
         -- available combinationally within the same cycle it's used
         -- (avoids an extra state/cycle per LED).
         variable want_on : std_logic;
+        -- 8x8 -> 16-bit products for the SCALE_BRIGHT state below.
+        variable prod_r, prod_g, prod_b : unsigned(15 downto 0);
     begin
         if reset = '1' then
             state       <= IDLE;
@@ -277,7 +355,11 @@ begin
 
             case state is
                 when IDLE =>
-                    if refresh_tick = '1' then
+                    -- Wait for FP_RAM_Store's post-reset init sequence
+                    -- to finish before ever reading it via addr_b, so
+                    -- the very first refresh after reset only ever
+                    -- sees fully-initialized RAM content.
+                    if refresh_tick = '1' and ram_init_done = '1' then
                         state <= LATCH_ST; bit_counter <= 0;
                     end if;
 
@@ -306,9 +388,10 @@ begin
                     -- r_col_b/r_map_b/r_fb_b are now valid. Pick this
                     -- LED's target state (mirror captured chain bit,
                     -- via the mapping table, or framebuffer bit) and
-                    -- drive its stored on/off colour straight through
-                    -- no fade ramp, no interpolation, no brightness
-                    -- scaling.
+                    -- select its stored on/off colour (R,G,B order, as
+                    -- stored -- see FP_RAM_Store.vhd) for brightness
+                    -- scaling and GRB reordering in SCALE_BRIGHT below.
+                    -- No fade ramp/interpolation between on and off.
                     if mode_reg = '0' then
                       want_on := shadow_reg(to_integer(r_map_b));
                       -- want_on := shadow_reg(to_integer(ctrl_idx)); -- WORKAROUND (bypasses mapping RAM): restore the line above and comment this one to re-test with r_map_b disabled.
@@ -317,12 +400,32 @@ begin
                     end if;
 
                     if want_on = '1' then
-                      final_rgb <= r_col_b(47 downto 24); -- on colour (G,R,B)
-                      -- final_rgb <= x"024000"; -- WORKAROUND (bypasses colour RAM): restore the two lines below and comment out the real assignments above to re-test with r_col_b disabled.
+                      sel_rgb <= r_col_b(47 downto 24); -- on colour (R,G,B)
+                      -- sel_rgb <= x"024000"; -- WORKAROUND (bypasses colour RAM): restore the two lines below and comment out the real assignments above to re-test with r_col_b disabled.
                     else
-                      final_rgb <= r_col_b(23 downto 0);  -- off colour (G,R,B)
-                      -- final_rgb <= x"000002";
+                      sel_rgb <= r_col_b(23 downto 0);  -- off colour (R,G,B)
+                      -- sel_rgb <= x"000002";
                     end if;
+
+                    state <= SCALE_BRIGHT;
+
+                when SCALE_BRIGHT =>
+                    -- Apply global brightness (0..255) to each channel
+                    -- independently: scaled = (channel * global_bright)
+                    -- / 256 -- the common 8-bit "scale8" convention
+                    -- (e.g. FastLED's scale8()); global_bright=0xFF is
+                    -- ~full brightness (off by <1 count vs true /255),
+                    -- global_bright=0 is fully off. Also reorders
+                    -- sel_rgb's stored R,G,B order into the G,R,B order
+                    -- the WS2812/SK6812 wire protocol expects -- the
+                    -- only place this reorder happens, so it's hidden
+                    -- from software entirely.
+                    prod_r := unsigned(sel_rgb(23 downto 16)) * global_bright;
+                    prod_g := unsigned(sel_rgb(15 downto 8))  * global_bright;
+                    prod_b := unsigned(sel_rgb(7 downto 0))   * global_bright;
+                    final_rgb(23 downto 16) <= std_logic_vector(prod_g(15 downto 8)); -- G
+                    final_rgb(15 downto 8)  <= std_logic_vector(prod_r(15 downto 8)); -- R
+                    final_rgb(7 downto 0)   <= std_logic_vector(prod_b(15 downto 8)); -- B
 
                     state <= SEND_PHY;
 

@@ -180,7 +180,7 @@ no LED ever lights.
   **MSB-first** (`chain_out <= shift_reg(TOTAL_WIDTH-1)`, with a matching
   left-shift), so an 8-bit source register's MSB reaches the first LED in
   the chain, matching left-to-right register-bit order under the default
-  identity `mapping.mif`.
+  identity mapping (see `FP_RAM_Store.vhd`).
 - **Colour path simplified.** The per-LED gradual fade between
   programmable ON/OFF colors (`alpha_ram` ramp, `MATH_INIT`/
   `MATH_CHANNEL`/`MATH_BRIGHT` in `FrontPanel_Subsystem.vhd`) has been
@@ -221,24 +221,72 @@ so Quartus's optimizer eliminated `color_ram` entirely (it never appeared
 in the fitter's RAM table) and collapsed `map_ram` down to a single read
 port. Restoring the real `r_col_b`/`r_map_b` usage brings both RAMs back
 into the build — confirmed by a fresh build: `color_ram` now appears as a
-64×48 M10K Simple Dual Port block. Separately, `color_ram`/`map_ram` had
-no VHDL-level default value (unlike `fb_ram`, which does), relying solely
-on the Quartus-only `ram_init_file` attribute, so any non-Quartus
-simulator (GHDL) saw them as uninitialized. Both now carry an explicit
-VHDL default matching the `.mif`s' documented intent (identity map /
-dim-green-off-bright-green-on), verified via a GHDL testbench that runs
-the Master Controller through a refresh cycle and checks `final_rgb`
-comes out non-zero. **Interesting side effect confirmed via the same
-build:** once a signal has both a VHDL default and a `ram_init_file`
-attribute, Quartus prefers the VHDL default and auto-derives its own
-internal `db/*.hdl.mif` from it, no longer referencing
-`colors.mif`/`mapping.mif` at all — this incidentally makes the
-long-standing `NUM_LEDS` (64, current bring-up rig) vs. `.mif` `DEPTH`
-(256, sized for the eventual full string) mismatch moot in practice,
-since Quartus now generates its own correctly-sized default from the
-VHDL literal rather than reading the external `.mif` files. `colors.mif`/
-`mapping.mif` are kept as documentation only; keep them in sync with
-`FP_RAM_Store.vhd`'s defaults by hand if either changes.
+64×48 M10K Simple Dual Port block.
+
+**Fixed: RAM contents now re-initialize on every reset, not just once at
+FPGA power-up.** `color_ram`/`map_ram`/`fb_ram` used to rely on either a
+Quartus-only `ram_init_file` attribute (a no-op in a plain VHDL simulator
+like GHDL) or a VHDL default value (applied once at elaboration, not on a
+later reset pulse) — neither gives reproducible behaviour across
+repeated Z-80 resets. `FP_RAM_Store.vhd` now has its own small init
+sequencer: on `reset`, it steps through every address for `NUM_LEDS` clk
+cycles, writing the default identity map / default on-off colour /
+all-off framebuffer, and holds a new `init_done` output low until it's
+finished. `FrontPanel_Subsystem`'s Master Controller (`IDLE` state) waits
+for `init_done` before starting the first refresh, so the very first
+refresh after any reset only ever sees fully-initialized RAM. The old
+external `colors.mif`/`mapping.mif` files were removed entirely — a
+Quartus 17.0 build had already shown that once a signal has both a VHDL
+default and a `ram_init_file` attribute, Quartus prefers the VHDL default
+and auto-derives its own internal `db/*.hdl.mif` from it, never actually
+reading the external `.mif` files — so `FP_RAM_Store.vhd`'s
+`DEFAULT_COLOR` constant and `init` sequencer are now the single source
+of truth for reset defaults.
+
+**Changed: colour interface is now R,G,B, not the LEDs' native G,R,B.**
+The `+3` colour-stream port and `color_ram`'s storage format used to
+match the WS2812/SK6812 wire protocol's native G,R,B byte order directly,
+requiring software to think in GRB. Both are now plain R,G,B (matching
+how every other colour API works); the GRB reorder the LEDs actually
+need happens only in a new `SCALE_BRIGHT` pipeline state, immediately
+before the PHY, so software never has to deal with the LEDs' GRB quirk.
+
+**Re-implemented: global brightness (`+0`).** Removed during the initial
+bring-up simplification along with the fade ramp; brightness is back as
+part of the same new `SCALE_BRIGHT` state, using the standard 8-bit
+"scale8" convention (`scaled = (channel * global_bright) / 256`, e.g.
+FastLED's `scale8()`) applied independently to each of the selected
+colour's three channels. `global_bright = 0xFF` is ~full brightness (off
+by <1 count vs. true /255 due to the `/256` convention), `0x00` forces
+the LED fully off. The fade-rate (`+1`) register remains stored/readable
+but inert; gradual fade *between* on and off colours is still future
+work.
+
+**Fixed while implementing the above: two write-path correctness bugs.**
+- The `+3`/`+5`/`+6` pointer auto-increment updated `global_ptr` in the
+  *same* cycle as the write commit (`we_col`/`we_map`/`we_fb` asserting),
+  but `FP_RAM_Store`'s actual RAM write only takes effect one
+  cross-entity clk edge later (the usual registered-signal handoff
+  latency between two separate synchronous entities). By the time the
+  write actually committed, `global_ptr` (and hence `addr_a`) had
+  already advanced to the next value, so every auto-incrementing write
+  silently landed one slot ahead of the address that was intended. Fixed
+  by deferring the pointer update by one extra cycle (a new
+  `pending_incr` signal) so `FP_RAM_Store` still sees the original
+  address at the moment its write actually commits. The read-side
+  auto-increment (`rd_done_pulse`, deferred until after the CPU samples
+  `dout`) was already immune to this class of bug by construction.
+- `global_ptr` could be driven past `NUM_LEDS-1` (trivially, e.g. by
+  streaming exactly `NUM_LEDS` accesses through `+5`/`+6` in a loop),
+  which is an out-of-bounds index into `color_ram`/`map_ram`/`fb_ram` —
+  undefined address-truncation behaviour in synthesis, and a hard
+  simulation failure under GHDL. The auto-increment now wraps at
+  `NUM_LEDS` back to 0 instead.
+
+All of the above (RAM re-init on a *second* reset, the RGB-in/GRB-out
+colour path, brightness scaling at full/half/zero, and a write landing
+at the correct pre-increment address) was verified with a dedicated GHDL
+testbench before being folded into the committed HDL.
 
 **Also fix while in this code:** `MultiComp.sv` currently declares
 `user_fpLED_serial` from `USER_OUT[4]` (a stale comment/declaration left
