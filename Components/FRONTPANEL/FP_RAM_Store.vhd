@@ -29,13 +29,46 @@ architecture rtl of FP_RAM_Store is
     attribute ramstyle : string;
     attribute ram_init_file : string;
 
+    -- NOTE on initial content: `ram_init_file` is a Quartus-only
+    -- synthesis attribute that preloads the M10K/MLAB block at
+    -- bitstream configuration time; it has no effect in a plain VHDL
+    -- simulator (GHDL, or ModelSim without an Altera-specific preload
+    -- flow), which will otherwise see these signals as uninitialized
+    -- ('U') until the first write. Both RAMs below therefore also
+    -- carry an explicit VHDL default value matching the corresponding
+    -- .mif's documented reset content, so behavioural simulation and
+    -- the real FPGA power-up state agree. fb_ram already had such a
+    -- default (it has no .mif at all) -- these two are brought in
+    -- line with it.
+    --
+    -- IMPORTANT (confirmed via a Quartus 17.0 build, see
+    -- output_files/MultiComp.fit.rpt): once a signal has BOTH a VHDL
+    -- default value and a `ram_init_file` attribute, Quartus prefers
+    -- the VHDL default -- it auto-derives its own internal
+    -- db/*.hdl.mif from the default value and does not reference
+    -- colors.mif/mapping.mif at all. In other words, colors.mif and
+    -- mapping.mif are no longer the active source of the RAM's reset
+    -- content; the VHDL default values immediately below are. Keep
+    -- them in sync manually if you edit one; colors.mif/mapping.mif
+    -- are kept only as documentation of the intended default and as a
+    -- template for a future runtime-loadable content scheme.
     type color_mem_t is array (0 to NUM_LEDS-1) of std_logic_vector(47 downto 0);
-    signal color_ram : color_mem_t;
+    -- Matches colors.mif: on = 0xFF0101 (bright green), off = 0x100101 (dim green).
+    signal color_ram : color_mem_t := (others => x"FF0101100101");
     attribute ramstyle of color_ram : signal is "M10K";
     attribute ram_init_file of color_ram : signal is "colors.mif";
 
     type map_mem_t is array (0 to NUM_LEDS-1) of unsigned(7 downto 0);
-    signal map_ram : map_mem_t;
+    -- Matches mapping.mif: identity map, entry i -> chain bit i.
+    function init_identity_map return map_mem_t is
+        variable result : map_mem_t;
+    begin
+        for i in map_mem_t'range loop
+            result(i) := to_unsigned(i, 8);
+        end loop;
+        return result;
+    end function;
+    signal map_ram : map_mem_t := init_identity_map;
     attribute ramstyle of map_ram : signal is "MLAB";
     attribute ram_init_file of map_ram : signal is "mapping.mif";
 

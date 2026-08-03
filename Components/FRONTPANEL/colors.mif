@@ -1,5 +1,14 @@
 -- Front-panel LED on/off colour table.
 --
+-- NOTE: as of the FP_RAM_Store.vhd default-initializer fix, Quartus no
+-- longer actually loads this file -- color_ram's VHDL default value
+-- (see FP_RAM_Store.vhd) takes precedence whenever both a VHDL default
+-- and a `ram_init_file` attribute are present, and Quartus auto-derives
+-- its own internal db/*.hdl.mif from that default instead (confirmed
+-- via output_files/MultiComp.fit.rpt). This file is kept only as
+-- documentation of the intended default; keep it in sync with
+-- FP_RAM_Store.vhd's color_ram default value by hand.
+--
 -- Each 48-bit entry holds the "on" colour in the upper 24 bits and the
 -- "off" colour in the lower 24 bits. The 24-bit colour fields are in
 -- GRB byte order to match the WS2812 / SK6812 wire protocol: byte 0

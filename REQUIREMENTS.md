@@ -196,6 +196,50 @@ needed:** re-test on real hardware to confirm LEDs actually light; if they
 still don't, the fault is elsewhere (PHY output enable, USER_IO pin
 routing/muxing, or the WS2812 power/data wiring itself).
 
+**Fixed: Z-80 I/O decoder re-triggering on every `clk` edge.** `clk` runs
+far faster than the (divided-down) Z-80 clock, so `io_cs`/`iorq_n`/`wr_n`/
+`rd_n` stayed asserted for several `clk` edges per Z-80 bus cycle. The
+decoder's write/read blocks were gated on the raw signal *levels*, so a
+single `OUT`/`IN` instruction caused pointer auto-increment, colour-stream
+byte collection, and register writes to fire several times instead of
+once. Fixed by deriving one-clk-wide `wr_pulse` (rising edge of the
+write-active condition — data is already valid then) and `rd_done_pulse`
+(falling edge of the read-active condition — deferred until after the CPU
+has sampled `dout`, avoiding a read-ahead hazard) and gating all the
+side-effecting logic on those pulses instead of the levels. The read
+*data* mux is unchanged/level-sensitive so `dout` stays valid for however
+long the CPU holds `RD` low. Verified with a standalone GHDL testbench
+that holds `wr_n`/`rd_n` low for 6 `clk` cycles (simulating the slow
+Z-80 clock) and confirms `global_ptr` advances by exactly 1 per access.
+
+**Fixed: `FP_RAM_Store` colour/map RAM read back as zero on hardware.**
+Root cause confirmed via `output_files/MultiComp.fit.rpt`: the Master
+Controller's only consumers of the colour/map RAM's read port
+(`r_col_b`, `r_map_b`) had been temporarily replaced with hardcoded
+literals for testing (now commented out, not deleted, for easy restore),
+so Quartus's optimizer eliminated `color_ram` entirely (it never appeared
+in the fitter's RAM table) and collapsed `map_ram` down to a single read
+port. Restoring the real `r_col_b`/`r_map_b` usage brings both RAMs back
+into the build — confirmed by a fresh build: `color_ram` now appears as a
+64×48 M10K Simple Dual Port block. Separately, `color_ram`/`map_ram` had
+no VHDL-level default value (unlike `fb_ram`, which does), relying solely
+on the Quartus-only `ram_init_file` attribute, so any non-Quartus
+simulator (GHDL) saw them as uninitialized. Both now carry an explicit
+VHDL default matching the `.mif`s' documented intent (identity map /
+dim-green-off-bright-green-on), verified via a GHDL testbench that runs
+the Master Controller through a refresh cycle and checks `final_rgb`
+comes out non-zero. **Interesting side effect confirmed via the same
+build:** once a signal has both a VHDL default and a `ram_init_file`
+attribute, Quartus prefers the VHDL default and auto-derives its own
+internal `db/*.hdl.mif` from it, no longer referencing
+`colors.mif`/`mapping.mif` at all — this incidentally makes the
+long-standing `NUM_LEDS` (64, current bring-up rig) vs. `.mif` `DEPTH`
+(256, sized for the eventual full string) mismatch moot in practice,
+since Quartus now generates its own correctly-sized default from the
+VHDL literal rather than reading the external `.mif` files. `colors.mif`/
+`mapping.mif` are kept as documentation only; keep them in sync with
+`FP_RAM_Store.vhd`'s defaults by hand if either changes.
+
 **Also fix while in this code:** `MultiComp.sv` currently declares
 `user_fpLED_serial` from `USER_OUT[4]` (a stale comment/declaration left
 over from before the LED output was moved to a different pin) and

@@ -1,5 +1,14 @@
 -- Front-panel LED -> chain-bit mapping table.
 --
+-- NOTE: as of the FP_RAM_Store.vhd default-initializer fix, Quartus no
+-- longer actually loads this file -- map_ram's VHDL default value
+-- (see FP_RAM_Store.vhd, init_identity_map) takes precedence whenever
+-- both a VHDL default and a `ram_init_file` attribute are present, and
+-- Quartus auto-derives its own internal db/*.hdl.mif from that default
+-- instead (confirmed via output_files/MultiComp.fit.rpt). This file is
+-- kept only as documentation of the intended default; keep it in sync
+-- with FP_RAM_Store.vhd's init_identity_map function by hand.
+--
 -- Each entry maps an LED index (0..255) to the bit position within the
 -- captured-state shift-register chain (chain_in/chain_out) that drives
 -- that LED. Out of the box every LED is identity-mapped to the chain

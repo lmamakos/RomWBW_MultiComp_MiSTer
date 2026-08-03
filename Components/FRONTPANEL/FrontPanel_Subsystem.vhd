@@ -99,6 +99,17 @@ architecture rtl of FrontPanel_Subsystem is
     signal mode_reg      : std_logic := '0';
     signal color_buf     : std_logic_vector(47 downto 0);
 
+    -- Edge detection for the Z-80 bus strobes. `clk` runs far faster
+    -- than the (divided-down) Z-80 clock, so io_cs/iorq_n/wr_n/rd_n
+    -- are level signals that stay asserted for several `clk` edges per
+    -- Z-80 bus cycle. Side effects (pointer auto-increment, colour-
+    -- stream byte collection, register writes) must fire exactly once
+    -- per access, so they are gated on one-shot pulses derived here
+    -- rather than on the raw signal levels.
+    signal write_active, write_active_d : std_logic := '0';
+    signal read_active,  read_active_d  : std_logic := '0';
+    signal wr_pulse, rd_done_pulse       : std_logic;
+
     -- RAM Wrapper Interface
     signal we_col, we_map, we_fb : std_logic := '0';
     signal dout_map : unsigned(7 downto 0);
@@ -109,7 +120,7 @@ architecture rtl of FrontPanel_Subsystem is
     signal r_fb_b   : std_logic;
 
     -- Master Controller State Machine
-    type state_t is (IDLE, LATCH_ST, SHADOW_SHIFT, FETCH_MEM, WAIT_MEM, SEND_PHY);
+    type state_t is (IDLE, LATCH_ST, SHADOW_SHIFT, FETCH_MEM, WAIT_MEM, WAIT_MEM2, SEND_PHY);
     signal state : state_t := IDLE;
 
     signal bit_counter : integer range 0 to NUM_LEDS-1 := 0;
@@ -140,7 +151,40 @@ begin
             dout_color_b => r_col_b, dout_map_b => r_map_b, dout_fb_b => r_fb_b
         );
 
+    -- Bus-cycle-active levels, sampled combinationally every clk edge.
+    write_active <= '1' when (io_cs = '1' and iorq_n = '0' and wr_n = '0') else '0';
+    read_active  <= '1' when (io_cs = '1' and iorq_n = '0' and rd_n = '0') else '0';
+
+    -- One-cycle-delayed copies used for edge detection below.
+    process(clk, reset)
+    begin
+        if reset = '1' then
+            write_active_d <= '0';
+            read_active_d  <= '0';
+        elsif rising_edge(clk) then
+            write_active_d <= write_active;
+            read_active_d  <= read_active;
+        end if;
+    end process;
+
+    -- wr_pulse: one clk-wide pulse at the START of a write cycle (din
+    -- is already stable by then, so side effects can commit safely).
+    -- rd_done_pulse: one clk-wide pulse at the END of a read cycle
+    -- (deferring the pointer bump until after the CPU has sampled dout
+    -- avoids advancing the RAM read address mid-cycle).
+    wr_pulse      <= '1' when (write_active = '1' and write_active_d = '0') else '0';
+    rd_done_pulse <= '1' when (read_active = '0' and read_active_d = '1') else '0';
+
     -- 2. Z80 I/O Streaming Port Decoder
+    --
+    -- NOTE: clk runs far faster than the (divided-down) Z-80 clock, so
+    -- io_cs/iorq_n/wr_n/rd_n stay asserted for several clk edges per
+    -- Z-80 bus cycle. All side effects below are gated on wr_pulse /
+    -- rd_done_pulse (single-cycle strobes, see above) rather than on
+    -- the raw signal levels, so each Z-80 access takes effect exactly
+    -- once -- an earlier revision that gated directly on the levels
+    -- caused every write and every pointer auto-increment to fire
+    -- multiple times per access.
     process(clk, reset)
     begin
         if reset = '1' then
@@ -161,11 +205,12 @@ begin
             -- we drive zero so the bus consumer never sees stale data.
             dout <= x"00";
 
-            -- Write path. Offsets within the 8-port window:
+            -- Write path (single-shot, see wr_pulse above). Offsets
+            -- within the 8-port window:
             --   +3 collects 6 colour bytes per LED before committing
             --      and advancing the pointer.
             --   +5 / +6 auto-advance the pointer on every write.
-            if io_cs = '1' and iorq_n = '0' and wr_n = '0' then
+            if wr_pulse = '1' then
                 case addr(2 downto 0) is
                     when "000" => global_bright <= unsigned(din);
                     when "001" => fade_rate <= unsigned(din);
@@ -182,18 +227,30 @@ begin
                 end case;
             end if;
 
-            -- Read path. Offsets +5 and +6 auto-increment global_ptr
-            -- on read as well as on write so software can stream
-            -- contents out without managing the pointer manually.
-            if io_cs = '1' and iorq_n = '0' and rd_n = '0' then
+            -- Read data path: level-sensitive and unchanged for as
+            -- long as the read cycle lasts, so dout stays valid no
+            -- matter how many clk edges rd_n remains low.
+            if read_active = '1' then
                 case addr(2 downto 0) is
                     when "000" => dout <= std_logic_vector(global_bright);
                     when "001" => dout <= std_logic_vector(fade_rate);
                     when "010" => dout <= std_logic_vector(global_ptr);
                     when "100" => dout <= (0 => mode_reg, others => '0');
-                    when "101" => dout <= std_logic_vector(dout_map); global_ptr <= global_ptr + 1;
-                    when "110" => dout <= (0 => dout_fb, others => '0'); global_ptr <= global_ptr + 1;
+                    when "101" => dout <= std_logic_vector(dout_map);
+                    when "110" => dout <= (0 => dout_fb, others => '0');
                     when others => null; -- +3 (write-only) and +7 (reserved) read 0
+                end case;
+            end if;
+
+            -- Read side effect (single-shot, see rd_done_pulse above):
+            -- +5 and +6 auto-increment global_ptr once per read access
+            -- (after the CPU has sampled dout) so software can stream
+            -- contents out without managing the pointer manually.
+            if rd_done_pulse = '1' then
+                case addr(2 downto 0) is
+                    when "101" => global_ptr <= global_ptr + 1;
+                    when "110" => global_ptr <= global_ptr + 1;
+                    when others => null;
                 end case;
             end if;
         end if;
@@ -229,7 +286,8 @@ begin
 
                 when SHADOW_SHIFT =>
                     shift_en <= '1';
-                    shadow_reg <= shadow_reg(NUM_LEDS-2 downto 0) & chain_in;
+                    -- shadow_reg <= shadow_reg(NUM_LEDS-2 downto 0) & chain_in;
+                    shadow_reg <= chain_in & shadow_reg(NUM_LEDS-1 downto 1);
                     if bit_counter = NUM_LEDS-1 then
                         ctrl_idx <= (others => '0'); state <= FETCH_MEM;
                     else bit_counter <= bit_counter + 1; end if;
@@ -241,25 +299,42 @@ begin
                     state <= WAIT_MEM;
 
                 when WAIT_MEM =>
+                    -- wait another tick
+                    state <= WAIT_MEM2;
+
+                when WAIT_MEM2 =>
                     -- r_col_b/r_map_b/r_fb_b are now valid. Pick this
                     -- LED's target state (mirror captured chain bit,
                     -- via the mapping table, or framebuffer bit) and
                     -- drive its stored on/off colour straight through
-                    -- -- no fade ramp, no interpolation, no brightness
+                    -- no fade ramp, no interpolation, no brightness
                     -- scaling.
-                    if mode_reg = '0' then want_on := shadow_reg(to_integer(r_map_b));
-                    else want_on := r_fb_b; end if;
+                    if mode_reg = '0' then
+                      want_on := shadow_reg(to_integer(r_map_b));
+                      -- want_on := shadow_reg(to_integer(ctrl_idx)); -- WORKAROUND (bypasses mapping RAM): restore the line above and comment this one to re-test with r_map_b disabled.
+                    else
+                      want_on := r_fb_b;
+                    end if;
 
-                    if want_on = '1' then final_rgb <= r_col_b(47 downto 24); -- on colour (G,R,B)
-                    else final_rgb <= r_col_b(23 downto 0); end if;           -- off colour (G,R,B)
+                    if want_on = '1' then
+                      final_rgb <= r_col_b(47 downto 24); -- on colour (G,R,B)
+                      -- final_rgb <= x"024000"; -- WORKAROUND (bypasses colour RAM): restore the two lines below and comment out the real assignments above to re-test with r_col_b disabled.
+                    else
+                      final_rgb <= r_col_b(23 downto 0);  -- off colour (G,R,B)
+                      -- final_rgb <= x"000002";
+                    end if;
 
                     state <= SEND_PHY;
 
                 when SEND_PHY =>
                     if phy_busy = '0' then
                         phy_start <= '1';
-                        if ctrl_idx = NUM_LEDS-1 then state <= IDLE;
-                        else ctrl_idx <= ctrl_idx + 1; state <= FETCH_MEM; end if;
+                        if ctrl_idx = NUM_LEDS-1 then
+                          state <= IDLE;
+                        else
+                          ctrl_idx <= ctrl_idx + 1;
+                          state <= FETCH_MEM;
+                        end if;
                     end if;
             end case;
         end if;

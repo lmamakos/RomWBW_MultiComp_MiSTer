@@ -30,9 +30,36 @@
 >    readable/writable but currently have no effect — they're reserved
 >    for reintroduction once basic LED output is confirmed on hardware.
 >
+> Two further bugs were found and fixed after that first bring-up pass:
+>
+> 3. **Z-80 I/O decoder no longer re-triggers on every `clk` edge.**
+>    `clk` runs far faster than the Z-80's own (divided-down) clock, so
+>    `io_cs`/`iorq_n`/`wr_n`/`rd_n` stayed asserted for several `clk`
+>    edges per Z-80 bus cycle; the decoder's write/read side effects
+>    were gated on those raw levels, so a single `OUT`/`IN` instruction
+>    caused pointer auto-increment and colour-stream byte collection to
+>    fire several times instead of once. Fixed with one-shot
+>    edge-detected strobes (`wr_pulse` at the start of a write,
+>    `rd_done_pulse` at the end of a read) gating the side effects,
+>    while `dout` itself stays level-driven so it remains valid for
+>    however long the CPU holds `RD` low.
+> 4. **`FP_RAM_Store` colour/map RAM restored.** The Master Controller's
+>    real colour/map RAM readback (`r_col_b`/`r_map_b`) had been
+>    temporarily swapped for hardcoded test literals, which caused
+>    Quartus's optimizer to eliminate `color_ram` from the build
+>    entirely (confirmed absent from the fitter report) and to collapse
+>    `map_ram`'s dead second read port. The real RAM-backed logic is
+>    restored (the old hardcoded literals are left commented out for
+>    easy A/B testing). Both `color_ram` and `map_ram` also gained an
+>    explicit VHDL default value (previously only `fb_ram` had one),
+>    matching their `.mif`s' documented intent, so GHDL/non-Quartus
+>    simulation sees sane content instead of `'U'`. A fresh Quartus
+>    build confirms `color_ram` is now a real 64×48 M10K block.
+>
 > All four VHDL files (`FP_RAM_Store`, `Transparent_Capture_Chain`,
 > `Universal_Capture_Chain`, `FrontPanel_Subsystem`) continue to analyze
-> and elaborate cleanly under GHDL VHDL-2008. Re-verify on hardware next.
+> and elaborate cleanly under GHDL VHDL-2008, and a full Quartus 17.0
+> build completes with 0 errors. Re-verify on hardware next.
 
 ## Ultimate front panel light display
 
