@@ -159,7 +159,7 @@ architecture rtl of FrontPanel_Subsystem is
     signal ram_init_done : std_logic;
 
     -- Master Controller State Machine
-    type state_t is (IDLE, LATCH_ST, SHADOW_SHIFT, FETCH_MEM, WAIT_MEM, WAIT_MEM2, SCALE_BRIGHT, SEND_PHY);
+    type state_t is (IDLE, LATCH_ST, LATCH_WAIT, SHADOW_SHIFT, FETCH_MEM, WAIT_MEM, WAIT_MEM2, SCALE_BRIGHT, SEND_PHY);
     signal state : state_t := IDLE;
 
     signal bit_counter : integer range 0 to NUM_LEDS-1 := 0;
@@ -364,7 +364,35 @@ begin
                     end if;
 
                 when LATCH_ST =>
-                    latch <= '1'; state <= SHADOW_SHIFT;
+                    latch <= '1'; state <= LATCH_WAIT;
+
+                when LATCH_WAIT =>
+                    -- The capture chains' parallel load only commits to
+                    -- their shift_reg one clk edge after `latch` is
+                    -- presented to them (chain_out is combinational off
+                    -- shift_reg, but shift_reg itself is an ordinary
+                    -- registered update) -- the same cross-entity
+                    -- registered-signal handoff latency documented for
+                    -- FETCH_MEM/WAIT_MEM below. Without this settle
+                    -- cycle, SHADOW_SHIFT's first sample would capture
+                    -- stale leftover chain data instead of the true,
+                    -- freshly-latched MSB: every real bit would land one
+                    -- shadow_reg slot later than intended, and the very
+                    -- last real bit would never be sampled at all.
+                    --
+                    -- shift_en is also raised here, a full state ahead
+                    -- of SHADOW_SHIFT's own first iteration, for the
+                    -- same reason: a shift committed to the chains'
+                    -- shift_reg only shows up on chain_out one clk edge
+                    -- later. latch still wins this cycle (the chains'
+                    -- own load-vs-shift priority), so this doesn't
+                    -- disturb the pending parallel load; it just means
+                    -- the chain's *first real shift* (exposing bit 1)
+                    -- has already committed by the time SHADOW_SHIFT
+                    -- samples it, instead of arriving one cycle late and
+                    -- producing a duplicated bit 0.
+                    shift_en <= '1';
+                    state <= SHADOW_SHIFT;
 
                 when SHADOW_SHIFT =>
                     shift_en <= '1';

@@ -98,15 +98,45 @@
 >      out-of-bounds array index for `color_ram`/`map_ram`/`fb_ram` --
 >      undefined in synthesis and a hard simulation failure under GHDL.
 >      The auto-increment now wraps at `NUM_LEDS` back to 0.
+> 9. **Shift-in capture chain was one bit short at each end (fixed).**
+>    Symptom on hardware: with a 64-bit chain (`fpChain` + 8 more bits of
+>    static test data + `fpChainEnd`, the latter two copies both sourced
+>    from the port `0xFF` `fpLatch` register), writing a value to
+>    `fpLatch` put its MSB one LED late at the head of the chain, and its
+>    LSB was entirely missing at the tail (with the tail group's MSB
+>    also one LED late). Root cause: the Master Controller's `LATCH_ST`
+>    state moved straight to `SHADOW_SHIFT` the same cycle `latch` was
+>    presented to the capture chains, but a capture chain's parallel
+>    load (`shift_reg <= captured_bits` on `latch = '1'`) — and likewise
+>    its shift (`shift_reg <= ... & chain_in` on `shift_en = '1'`) — only
+>    commits one `clk` edge later (`chain_out` is combinational off
+>    `shift_reg`, but `shift_reg` itself is an ordinary registered
+>    update). `SHADOW_SHIFT` started sampling `chain_in` one cycle too
+>    early relative to both the load and, separately, the first shift,
+>    so bit 0 was captured twice (once as stale/pre-load data, again as
+>    a duplicate of the true bit 0) while the very last real bit was
+>    never sampled at all — the same 64-cycle budget was spent on 63
+>    real bits plus one wasted/duplicate cycle instead of 64 real bits.
+>    Fixed with a new `LATCH_WAIT` settle state between `LATCH_ST` and
+>    `SHADOW_SHIFT` (mirroring the existing `FETCH_MEM`/`WAIT_MEM`
+>    cross-entity-latency idiom) that also raises `shift_en` a full
+>    state ahead of `SHADOW_SHIFT`'s own first iteration, so both the
+>    load and the first shift have already committed by the time
+>    capturing begins. No change to the 64-cycle `SHADOW_SHIFT` loop
+>    bound was needed.
 >
 > All four VHDL files (`FP_RAM_Store`, `Transparent_Capture_Chain`,
 > `Universal_Capture_Chain`, `FrontPanel_Subsystem`) continue to analyze
 > and elaborate cleanly under GHDL VHDL-2008, and a full Quartus 17.0
-> build completes with 0 errors. Points 5-8 above were verified with a
-> dedicated GHDL testbench covering: RAM defaults after both the first
-> and a *second* reset, a `+3`/`+5`/`+6` write landing at the correct
-> (pre-increment) address, the RGB-in/GRB-out colour path, and
-> brightness scaling at full/half/zero. Re-verify hardware next.
+> build completes with 0 errors. Points 5-9 above were verified with
+> dedicated GHDL testbenches: RAM defaults after both the first and a
+> *second* reset, a `+3`/`+5`/`+6` write landing at the correct
+> (pre-increment) address, the RGB-in/GRB-out colour path, brightness
+> scaling at full/half/zero, and (point 9) all 64 `shadow_reg` bit
+> positions checked bit-for-bit against a full 3-stage chain topology
+> (matching `MicrocomputerZ80CPM.vhd`'s wiring) across four different
+> bit patterns, including back-to-back refresh cycles. Re-verify
+> hardware next.
 
 ## Ultimate front panel light display
 

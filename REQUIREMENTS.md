@@ -288,6 +288,37 @@ colour path, brightness scaling at full/half/zero, and a write landing
 at the correct pre-increment address) was verified with a dedicated GHDL
 testbench before being folded into the committed HDL.
 
+**Fixed: shift-in capture chain landed each bit one LED late (and lost
+the last bit entirely).** Reported on real hardware after extending the
+chain to 64 bits (`fpChain` + `fpChainStaticTest` + `fpChainEnd`, the
+latter two both fed by the port `0xFF` `fpLatch` register): writing a
+value to `fpLatch` put its MSB one LED position later than expected at
+the *head* of the chain (LED 1 instead of LED 0), and at the *tail* the
+same value's LSB was missing entirely, with its MSB also one LED late.
+Root cause: `FrontPanel_Subsystem`'s Master Controller moved directly
+from `LATCH_ST` to `SHADOW_SHIFT` the same cycle `latch` was presented
+to the capture chains, but a capture chain's parallel load only commits
+to its `shift_reg` one `clk` edge later (`chain_out` is combinational
+off `shift_reg`, but `shift_reg` itself is an ordinary registered
+update) — the same cross-entity registered-signal handoff latency
+already documented for `FETCH_MEM`/`WAIT_MEM` above, here applied to
+`latch`/`chain_out` instead of RAM `addr`/`dout`. The same latency
+applies separately to the *first* `shift_en`-driven shift (advancing
+from bit 0 to bit 1). `SHADOW_SHIFT` started sampling `chain_in` one
+cycle too early on both counts, so bit 0 was captured twice (once
+against stale pre-load data, once as a duplicate of the true bit 0)
+while the true final bit of the whole 64-bit chain was never sampled at
+all. Fixed with a new `LATCH_WAIT` settle state between `LATCH_ST` and
+`SHADOW_SHIFT` that also raises `shift_en` a full state ahead of
+`SHADOW_SHIFT`'s own first iteration, so both the parallel load and the
+first shift have already committed by the time real capturing begins.
+The existing 64-cycle `SHADOW_SHIFT` loop bound needed no change.
+Verified with a dedicated GHDL testbench instantiating the full 3-stage
+chain topology (matching `MicrocomputerZ80CPM.vhd`'s wiring exactly) and
+checking all 64 `shadow_reg` bit positions against four different bit
+patterns, including back-to-back refresh cycles (steady-state, not just
+post-reset) — all 256 checks (4 patterns × 64 bits) pass.
+
 **Also fix while in this code:** `MultiComp.sv` currently declares
 `user_fpLED_serial` from `USER_OUT[4]` (a stale comment/declaration left
 over from before the LED output was moved to a different pin) and
