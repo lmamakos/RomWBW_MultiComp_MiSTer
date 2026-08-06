@@ -57,8 +57,8 @@ architecture rtl of FP_RAM_Store is
     -- FrontPanel_Subsystem, immediately before the PHY, so this
     -- storage format and the +3 write format agree and the GRB
     -- quirk of the physical LEDs is never visible to software.
-    -- Default: on = bright green (R=0x01,G=0xFF,B=0x01), off = dim
-    -- green (R=0x01,G=0x10,B=0x01).
+    -- Default: on = bright red (R=0xFF,G=0x00,B=0x01), off = dim blue
+    -- (R=0x00,G=0x00,B=0x09).
     constant DEFAULT_COLOR : std_logic_vector(47 downto 0) := x"FF0001000009";
 
     type color_mem_t is array (0 to NUM_LEDS-1) of std_logic_vector(47 downto 0);
