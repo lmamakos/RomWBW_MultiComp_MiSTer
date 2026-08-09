@@ -462,13 +462,14 @@ fpLatchDataOut <= fpLatch;
 -- clock. 50_000_000 / 60 = 833_333. The fpRefreshCount comparison
 -- against the integer literal works under the std_logic_arith
 -- package family used throughout this wrapper.
+-- updated: to 100Hz update rate - 50_000_000 / 100 = 500_00
 process(clk)
 begin
 	if rising_edge(clk) then
 		if N_RESET = '0' then
 			fpRefreshCount <= (others => '0');
 			fpRefreshTick  <= '0';
-		elsif fpRefreshCount = 833333-1 then
+		elsif fpRefreshCount = 800000-1 then
 			fpRefreshCount <= (others => '0');
 			fpRefreshTick  <= '1';
 		else
@@ -531,7 +532,7 @@ fpChainEnd :  entity work.Transparent_Capture_Chain
 -- mode through ports +5/+6.
 fpSubsys : entity work.FrontPanel_Subsystem
 	generic map (
-		NUM_LEDS => 64,
+		NUM_LEDS => 256,
 		SYS_CLK  => 50000000
 	)
 	port map (
