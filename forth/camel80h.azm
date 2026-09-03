@@ -1023,15 +1023,39 @@ WDS1:   DW DUP,COUNT,TYPE,SPACE,NFATOLFA,FETCH
 DOTS1:  DW II,FETCH,UDOT,LIT,-2,XPLUSLOOP,DOTS1
 DOTS2:  DW EXIT
 
+; BLOCK I/O TRANSFER BUFFER =======================
+;
+; A single 1024-byte buffer is needed very early (before blocks.fth's
+; BLOCK/BUFFER buffer pool exists) by the low-level bootstrap LOAD word
+; in io-cpm.azm / io-multi.azm, to hold one FORTH block while it is
+; read in and EVALUATEd.  It used to be a hard-coded absolute address
+; (e.g. 8000h) picked by hand for each target; instead it is allocated
+; dynamically out of the dictionary at cold-start, below, using the
+; ordinary HERE/ALLOT mechanism.  Since this is done entirely with
+; portable, target-independent kernel words, it works unchanged for
+; the embedded (bare-metal) build, the CP/M build, and any future
+; RomWBW/HBIOS build -- each simply gets the buffer placed just past
+; whatever its own compiled dictionary happens to end at.
+;
+;Z BLKBUF   -- a-addr   holds address of block I/O transfer buffer
+;                       (filled in once, by COLD, below)
+    head BLKBUF,6,'BLKBUF',dovar
+        DW 0
+
+; size, in bytes, of one FORTH block transfer buffer
+BLKBUFSIZE EQU 1024
+
 ; XXX - this needs to move to a different file with all of
 ;       the platform specific code in one spot
 ;Z COLD     --      cold start Forth system
 ;   UINIT U0 #INIT CMOVE      init user area
+;   HERE BLKBUF !  BLKBUFSIZE ALLOT   allocate block I/O buffer
 ;   80 COUNT INTERPRET       interpret CP/M cmd
 ;   ." Z80 CamelForth etc."
 ;   ABORT ;
     head COLD,4,'COLD',docolon
         DW UINIT,U0,NINIT,CMOVE
+        DW HERE,BLKBUF,STORE, LIT,BLKBUFSIZE,ALLOT
     IFDEF CPM
         DW LIT,80h,COUNT,INTERPRET
     ENDIF

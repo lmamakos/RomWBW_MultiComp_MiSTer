@@ -63,7 +63,24 @@ KEY2:   DW SAVEKEY,CFETCH,LIT,0,SAVEKEY,CSTORE
         jp 0
 
 ; ------------------------------------------------------------------
-; CPM low-level I/O words to CP/M file system
+; CP/M constants
+BD$OPEN    EQU 15	; open file
+BD$CLOSE   EQU 16 	; close file 
+BD$CREATE  EQU 22	; create file	
+BD$SETDMA  EQU 26	; set DMA (I/O transfer address
+BD$RDRND   EQU 33	; read random
+BD$WRRND   EQU 34	; write random
+BD$SETRR   EQU 36	; set random record number 
+BD$WRRNDZ  EQU 40	; write random with zero-fill
+; BD$SMSCNT (function 44, "set multi-sector count") is a CP/M 3.x-only
+; BDOS call and is NOT available under CP/M 2.2.  It is intentionally
+; unused below -- see file$io, which instead loops over 8 individual
+; 128-byte CP/M records to move one 1024-byte FORTH block, so that the
+; same driver works unmodified on both CP/M 2.2 and CP/M 3.0.
+BD$SMSCNT  EQU 44	; set multi-sector count CP/M 3.x (unused, see above)
+
+; ------------------------------------------------------------------
+; CP/M low-level I/O words to CP/M file system
 ;
 ;  8 char name, 3 char "type"
 ;              '12345678'
@@ -86,16 +103,34 @@ fcb$buf:  DS 40
     dw LIT,block$name, fcb$, LIT, 1, PLUS, LIT,11
     dw CMOVE    ; copy in the file name
 
-    dw fcb$,LIT,15,BDOS ; BDOS open
+    dw fcb$, LIT,BD$OPEN, BDOS ; BDOS open
     dw DROP   ; probably should check the return status..
     dw EXIT
 
 ; file-io  ( operation block# buffer-adr -- status )
+;   Transfer one 1024-byte FORTH block between 'buffer-adr' and the
+;   open block file, using CP/M's random-access record I/O.  'operation'
+;   is the BDOS function to use for each record: BD$RDRND, BD$WRRND, or
+;   BD$WRRNDZ.
+;
+;   CP/M 2.2 has no multi-sector I/O call (that's a CP/M 3.x-only
+;   feature -- see BD$SMSCNT above), so a 1024-byte FORTH block is
+;   moved as EIGHT separate 128-byte CP/M records instead: seek once to
+;   the base record (block# * 8), then loop 8 times, each pass setting
+;   the DMA address to the next 128-byte slice of the buffer, doing one
+;   BDOS random-I/O call, and bumping the FCB's random record number by
+;   one for the next pass.  This works unchanged on CP/M 2.2 and 3.0.
   head file$io,7,'io-file',docolon
-    dw LIT,26, BDOS, DROP   ; set DMA address
-    dw LIT,8, LIT,44, BDOS, DROP    ; set multi-sector count
-    dw file$seek
-    dw FCB$, SWOP, BDOS
+    dw SWOP, file$seek          ; ( operation buffer-adr )  FCB rec# := block#*8
+    dw LIT,8, LIT,0, XDO        ; do 8 records, I = 0..7
+FIO1:
+    dw DUP, II, LIT,80h, STAR, PLUS     ; ( op buf sector-addr )  buf + I*128
+    dw LIT,BD$SETDMA, BDOS, DROP        ; set DMA to this 128-byte slice
+    dw OVER, FCB$, SWOP, BDOS, DROP     ; do the 128-byte record I/O
+    dw FCB$, LIT,33, PLUS               ; ( op buf addr-of-fcb-rec# )
+    dw DUP, FETCH, ONEPLUS, SWOP, STORE ; bump FCB rec# for the next pass
+    dw XLOOP,FIO1
+    dw TWODROP, LIT,0                   ; caller ignores status; return 0
     dw EXIT
 
 ; seek-file  ( block-num -- )
@@ -107,35 +142,35 @@ fcb$buf:  DS 40
 
 ; read-file
   head read$file,9,'read-file',docolon
-    dw LIT,33, ROT, ROT, file$io
+    dw LIT,BD$RDRND, ROT, ROT, file$io
     dw DROP  ; ignore status
     dw EXIT
 
 ; write-file
   head write$file,10,'write-file',docolon
-    dw LIT,40, ROT, ROT, file$io
+    dw LIT,BD$WRRNDZ, ROT, ROT, file$io
     dw DROP  ; ignore status    
     dw EXIT
 
-
-; I know this is ugly, for now
-disk$buf    EQU 8000h
 
 ; load - load and evaluate a block from the (open)
 ;        block file.   Pretty bare-bones and expected
 ;        to be replaced by a more sophisticated version
 ;        from the FORTH environment extended after loading
 ;
+; Uses BLKBUF (see camel80h.azm), the dynamically-allocated one-block
+; transfer buffer, rather than a hard-coded address.
+;
 ;     HEX
-;     : LOAD (blocknum -- ) open-file 8000 read-file
-;       10 0 DO 8000 I 40 * + 40 2DUP CR BASE @ DECIMAL I . BASE ! 3E EMIT
+;     : LOAD (blocknum -- ) open-file BLKBUF @ read-file
+;       10 0 DO BLKBUF @ I 40 * + 40 2DUP CR BASE @ DECIMAL I . BASE ! 3E EMIT
 ;       SPACE TYPE EVALUATE LOOP ;
   head load$extend,4,'LOAD',docolon
     DW open$file
-    DW LIT,disk$buf, read$file
+    DW BLKBUF,FETCH, read$file
     DW LIT,10h, LIT,0, XDO
 LOAD1:
-    DW LIT,disk$buf, II
+    DW BLKBUF,FETCH, II
     DW LIT,40h, STAR, PLUS
     DW LIT,40h, TWODUP, CR
     DW BASE, FETCH, DECIMAL, II, DOT, BASE, STORE

@@ -1880,3 +1880,361 @@ future debugging; it should be done alongside, not instead of, the targeted fix.
 5. Keep each fix in its own commit so a regression can be isolated and reverted
    without touching the others.
 
+## Session update — CamelFORTH CP/M port: block I/O, dynamic buffers, and
+## a per-line `LOAD`/`EVALUATE` bug report investigation
+
+Continuation of "Integrated Camel FORTH" (see above). This session's work is
+entirely in `forth/`; no HDL was touched. Goal: get a CP/M 2.2/3.0-hosted
+build of CamelFORTH (`io-cpm.azm`) able to use a real CP/M file as FORTH
+block storage, on par with the embedded/bare-metal build (`io-multi.azm`),
+and get rid of hand-picked absolute-address hacks in the block-buffer code.
+
+### `io-cpm.azm`: CP/M 2.2 compatibility fix for multi-sector block I/O — done
+
+**Problem.** The prototype `file$io` word used BDOS function 44
+(`BD$SMSCNT`, "set multi-sector count"), which is a **CP/M 3.x-only**
+call — it does not exist on CP/M 2.2, which was a hard requirement.
+
+**Fix.** `file$io` (`forth/io-cpm.azm`) now moves a 1024-byte FORTH block as
+**eight separate 128-byte CP/M records** in a loop, using only BDOS calls
+available since CP/M 1.4/2.2 (`BD$SETDMA`=26, `BD$RDRND`=33, `BD$WRRND`=34,
+`BD$WRRNDZ`=40):
+
+1. `SWOP, file$seek` — seek once to the base record (`block# * 8`).
+2. `LIT,8, LIT,0, XDO` — loop `I = 0..7` using the kernel's existing
+   `(do)/(loop)` primitives (`XDO`/`XLOOP`, same idiom as `load$extend`).
+3. Each pass: compute `buffer-adr + I*128` (`DUP, II, LIT,80h, STAR, PLUS`),
+   `BD$SETDMA` to that address, do the single-record BDOS call (whichever
+   `operation` was passed in), then bump the FCB's 16-bit random-record
+   field (offset 33) by one for the next pass.
+4. Return a placeholder `0` status (unused — `read-file`/`write-file` already
+   `DROP` it).
+
+`read-file`/`write-file`'s external signature
+(`operation block# buffer-adr -- status` for `file$io`;
+`block# buffer-adr --` for the callers) is unchanged, so nothing else needed
+to be touched. `BD$SMSCNT` is left defined (for documentation) but marked
+unused.
+
+**Verification.** No Z80 hardware available in this environment; verified by
+reassembling a CP/M variant (`um80 camel80.azm -D CPM`) and checking the
+`.prn` listing byte-for-byte for the expected thread, then linking with
+`ul80` to confirm no assembler/linker errors. See "Z-80 emulation harness"
+below for how this was later exercised dynamically too (the `LOAD` word
+built on top of this code was run end-to-end in emulation and correctly
+round-tripped multi-line block content through this exact 8-record loop).
+
+### Dynamic block-I/O transfer buffer (`BLKBUF`), replacing hard-coded `disk$buf` — done
+
+**Problem.** Both `io-cpm.azm` and `io-multi.azm` used
+`disk$buf EQU 8000h` — a hand-picked absolute address for the one-block
+(1024-byte) scratch buffer used by the low-level bootstrap `LOAD` word,
+already flagged in the source as "I know this is ugly, for now". This
+address has no relationship to the actual dictionary size or target memory
+map, and (not coincidentally) collides on purpose with `blocks.fth`'s own
+`FIRST` buffer-pool base — a second instance of the same hack (see below).
+
+**Fix — recommended mechanism (portable across CP/M, embedded, and a future
+RomWBW/HBIOS target):** allocate the buffer once, at cold-start, using the
+ordinary `HERE`/`ALLOT` dictionary-growth primitives — exactly what a Forth
+programmer would type interactively (`CREATE X 1024 ALLOT`), just invoked
+directly from the `COLD` thread since `HERE`/`ALLOT` need no input-stream
+parsing (unlike `CREATE`). This works on every target because `HERE` reads
+back the `DP` user variable, which every target already initializes to
+`enddict` (the address immediately following that target's own compiled
+dictionary, computed automatically by the assembler for each target/build) —
+so the buffer always lands in free RAM just past the dictionary, with no
+target-specific address to hand-pick, ever.
+
+Implementation (`forth/camel80h.azm`, shared/portable core — used by every
+target):
+
+```
+    head BLKBUF,6,'BLKBUF',dovar
+        DW 0
+BLKBUFSIZE EQU 1024
+    head COLD,4,'COLD',docolon
+        DW UINIT,U0,NINIT,CMOVE
+        DW HERE,BLKBUF,STORE, LIT,BLKBUFSIZE,ALLOT
+    IFDEF CPM
+        DW LIT,80h,COUNT,INTERPRET
+    ENDIF
+        ...
+```
+
+`io-cpm.azm` and `io-multi.azm`: removed `disk$buf EQU 8000h`; every
+`LIT,disk$buf` became `BLKBUF,FETCH` in `load$extend`. Verified by
+reassembling both the `-D CPM` and default (embedded) targets cleanly and
+confirming the `.prn` listings show `COLD` allocating the buffer and
+`load$extend` fetching it correctly on both.
+
+### `blocks.fth` / `forth/blocks/*.fth`: same fix applied to the `FIRST`/`LIMIT` block-buffer pool — done
+
+**Important discovery:** `forth/blocks.fth` (the single monolithic file) is
+**not actually used by any build** — its own header comment says it's "the"
+reference copy, "manually split into multiple 16-line screens ... within the
+`blocks` directory". The code that actually ships (built into
+`blocks/forth.blk` by `forth/blocks/Makefile`, then loaded at runtime by both
+targets) is the separately-maintained, slightly-diverged copy in
+`forth/blocks/02-blocks.fth`, `03-blocks.fth`, `04-blocks.fth`, and (for a
+derived constant) `10-editor.fth`. **Both copies needed the fix**; fixing
+only `blocks.fth` would not have changed real runtime behaviour. Keep this in
+mind for *any* future change to the block/editor code — check `blocks.fth`
+*and* the matching `blocks/NN-*.fth` screen(s), and keep them in sync.
+
+**The hack:** `8000 CONSTANT FIRST` / `FIRST B/REC #BUFF * + CONSTANT LIMIT`
+— the `#BUFF`-buffer block-cache pool used by `BLOCK`/`BUFFER`/`FLUSH`, at
+the same hand-picked `8000h` address as the old `disk$buf` (intentionally,
+since the bootstrap `LOAD` only uses that memory transiently before
+`blocks.fth`'s buffer pool takes it over — but still an address totally
+disconnected from the real dictionary size).
+
+**Fix (pure Forth, no OS-specific code needed at all — this file is loaded
+identically on every target):** `FIRST` and `LIMIT` become `VARIABLE`s
+(forward-declared early, like `BLKBUF`) instead of `CONSTANT`s with a
+hard-coded value; every call site changed from bare `FIRST`/`LIMIT` to
+`FIRST @`/`LIMIT @` (`+BUF`, `BUFFER`, `BLOCK`, `FLUSH`, `EMPTY-BUFFERS`,
+`MAKE-BLOCKS`). `PREV`/`USE` are declared but no longer initialized inline
+(their real value depends on `FIRST`, not known yet at that point). After
+*every* word that references `FIRST`/`LIMIT` has been compiled, one small
+one-time block does the real allocation:
+
+```
+HERE FIRST !
+FIRST @ B/REC #BUFF * + LIMIT !
+FIRST @ DUP PREV ! USE !
+B/REC #BUFF * ALLOT
+```
+
+This must run exactly once (it's plain interpreted code at the end of the
+file, *not* inside a re-callable word like `EMPTY-BUFFERS`/`OPEN-BLOCKS` —
+calling `ALLOT` again on every `OPEN-BLOCKS` would leak dictionary memory
+every time a block file is (re-)opened).
+
+`forth/blocks/10-editor.fth`'s `ZZZ` scratch/working buffer
+(`LIMIT 10 + CONSTANT ZZZ`) was updated to `LIMIT @ 10 +`, so it
+automatically tracks wherever the now-dynamic pool ends up too. **Not fully
+fixed / follow-up for later:** `ZZZ`'s own buffer memory (and the larger
+buffer built on top of it via `PADDR` in later editor screens) is still
+never `ALLOT`-protected — it just assumes free space past `LIMIT`. It no
+longer depends on a hard-coded *address* (it tracks `LIMIT` dynamically
+now), but the memory itself still isn't reserved. Apply the same
+`HERE ... ALLOT` pattern there if this ever causes a real collision.
+
+**`forth/blocks/*.fth` screen-format constraint to remember:** each `NN-*.fth`
+file must stay within **16 lines × 64 columns** — `forth/blocks/Makefile`'s
+per-file build rule enforces this with an `awk` check
+(`length > 64` / `FNR > 16` → hard build error) before calling
+`../mkblk.sh`. All the edits above were re-checked against this budget by
+hand (e.g. shortening `( addr1-- addr2)` to `( a -- a)` in `+BUF`'s stack
+comment on `02-blocks.fth` to make room). **Gotcha found incidentally (not
+caused by this session's edits, pre-existing):** `forth/blocks/01-utils.fth`
+line 4 is currently **65 characters** (one over the limit) —
+`make -B 01-utils.blk` fails the `awk` check
+(`01-utils.fth:4: line is 65 bytes (max 64)`). It didn't block this session's
+work (only `02/03/04-blocks.fth` and `10-editor.fth` needed rebuilding, and
+`make` without `-B` reused the existing, already-valid `01-utils.blk`), but
+it means `forth.blk` cannot currently be regenerated from scratch
+(`make -B forth.blk`) until that line is fixed or shortened. Flagging for a
+future session — not fixed here since it's unrelated to the buffer-allocation
+work and the offending character (in this specific case) is only a redundant
+trailing space, so nothing is actually broken in the *currently checked-in*
+`.blk` build products.
+
+**Verification.** Rebuilt the affected screens with `mkblk.sh`/`make`
+(`forth/blocks/Makefile`'s awk length/line-count checks all pass), and
+visually diffed the assembled 1024-byte block content with `forth/blk2txt`.
+
+### Z-80 emulation harness for dynamic testing (new capability for future sessions) — built, useful, kept in `/tmp` only
+
+No Z80/CP/M emulator was preinstalled. Found and used the **`z80`** PyPI
+package (`pip install --break-system-packages z80`; by Ivan Kosarev,
+<https://github.com/kosarev/z80>) — a real, fast, well-documented Z80/8080
+emulator with Python bindings (`z80.Z80Machine`), memory/IO
+read/write/breakpoint callback hooks, and register access as Python
+properties (`m.bc`, `m.pc`, `m.iy`, ...). This is a generically useful
+capability worth remembering for any future "does this actually work"
+question about the FORTH kernel that doesn't require real hardware.
+
+**Harness technique that worked (documented here so it doesn't need to be
+re-derived):**
+
+- Assemble a CP/M variant of `camel80.azm` (temporarily stub out the two
+  `call puts` / `call introdump` debug lines with `um80`/`sed`, since those
+  are only defined in `io-multi.azm` and the code unconditionally calls them
+  today — a pre-existing gap in `camel80.azm`'s `IFDEF CPM` separation, not
+  something fixed in this session; see "Outstanding work" below).
+  `um80 camel80.azm -D CPM -g -o out.rel -l out.prn`, then
+  `ul80 -p 0 --sym -x -o out.hex out.rel`, `objcopy -I ihex -O binary` to get
+  a flat image and a `.sym` symbol table (`ADDR NAME` per line, easy to
+  `dict()`-ify in Python).
+- Load the binary at `0x100` (the CP/M `org`) into a `z80.Z80Machine()`'s
+  64 KB `memory` bytearray.
+- **Do not bother running real `RESET`/`COLD`/`QUIT`.** For the CP/M build,
+  `$ENDADDR EQU 8000h` is hard-coded (see "Outstanding work" below — this
+  build does *not* probe CP/M's actual TPA size via location `0006h`), so
+  `reset::`'s stack/user-area setup is fully deterministic:
+  `SP=0x7F00` (param stack top), `IX=0x8000` (return stack top),
+  `IY=0x7E00` (user-area base). Just poke these directly, and poke the
+  18-byte user area (`UINIT`'s layout: `reserved@0, >IN@2, BASE@4,
+  STATE@6, DP@8, 'SOURCE@10(2 cells), LATEST@14, HP@16`) with `DP=ENDDICT`
+  (or `ENDDICT+BLKBUFSIZE` post-`BLKBUF`-alloc), `BASE=10`, `STATE=0`,
+  `LATEST=<the LASTWORD symbol>`. All of `ENDDICT`/`LASTWORD`/`BLKBUF`/
+  whatever word you want to call come straight out of the `.sym` file.
+- To directly invoke *any* `docolon` word (e.g. `EVALUATE`, `LOAD$EXTEND`)
+  without going through `QUIT`: push its Forth arguments the normal way
+  (`BC` = TOS, rest on the Z80 hardware stack at `[SP]`, `[SP+2]`, ...), set
+  `DE` (the Forth IP) to point at a 1-cell scratch thread containing
+  `DW BYE` (`BYE` = `jp 0`, already in the kernel), set `PC` to the word's
+  **CFA address** (the label itself, *not* its body) and `run()`. This works
+  because a `docolon` word's CFA is `call docolon` — the Z80 `call`
+  instruction's own return-address push (of the body's address) is exactly
+  what `docolon`/`enter` expects to find on the Z80 hardware stack, so
+  jumping to any docolon word's CFA "just works" as if it had been called
+  from a running thread. When the word's `EXIT` eventually runs, it pops the
+  old IP (which we set to the `DW BYE` cell) and continues there, hitting
+  `BYE`'s `jp 0`. **Set a breakpoint at address `0` to detect clean
+  completion**, and one at `ABORT`'s address to detect an interpreter error
+  (undefined word / bad number) — no need to instrument `EMIT`/`TYPE`
+  output at all for pass/fail detection, though capturing it (see next
+  point) is useful for debugging.
+- Stub BDOS (`mem[5] = 0xC9` i.e. `RET`) for a "don't care about I/O, just
+  don't crash" run, **or** set a breakpoint at address `5` and manually
+  handle just the functions needed (`6`=console char out, `15`=open,
+  `26`=set DMA, `33`/`34`/`40`=random read/write — read the FCB's record
+  number from `mem[fcb+33..34]`, serve 128 bytes from a canned in-memory
+  "disk block", write to whatever the last `26` call set as the DMA
+  address), then simulate the `RET` yourself
+  (`pc = mem[sp] | mem[sp+1]<<8; sp += 2`) to resume. This is enough to run
+  the *real* compiled `LOAD`/`open-file`/`read-file`/`file$io` code
+  end-to-end against synthetic block content, which is exactly how the
+  `io-cpm.azm` CP/M-2.2 8-record loop (above) and the per-line `LOAD`/
+  `EVALUATE` investigation (below) were exercised.
+- Watch out for the emulator's `run()` returning on an `_END_OF_FRAME` event
+  (bit `1<<3`) even with no breakpoint hit and ticks remaining — it's a
+  periodic/frame-boundary event unrelated to CPU halt state. Loop calling
+  `run()` with a bounded `ticks_to_stop` per call, checking `pc` against
+  your breakpoints after each call, until one hits or a generous chunk
+  budget is exhausted (a full 16-line block `LOAD`, each line echoed via
+  `TYPE`, needs on the order of 1000+ BDOS/breakpoint round-trips just for
+  the character-by-character `EMIT` calls — size the chunk budget
+  accordingly, e.g. 5000+ chunks of 200 000 ticks each was comfortably
+  enough and still ran in well under a second).
+
+The harness scripts themselves were exploratory/throwaway and were **not**
+committed (kept under `/tmp/opencode/z80test/` only, outside the repo) —
+recreate from the description above if needed again; the technique is the
+useful, durable part.
+
+### Investigated: reported subtle bug in per-line `LOAD`/`EVALUATE` — **not reproduced**; real limitation found and documented instead
+
+**Report:** using the low-level bootstrap `LOAD` word (present in both
+`io-cpm.azm` and `io-multi.azm`, which both interpret a 1024-byte FORTH
+block **one 64-byte line at a time** via 16 separate `EVALUATE` calls), an
+error was reported that seemed tied to whether the text on the *last line of
+a block* runs all the way to column 64 or stops short of it (padded with
+trailing spaces) — suspected off-by-one in `EVALUATE`/`WORD`/`INTERPRET`
+(`forth/camel80h.azm`).
+
+**Investigation performed (both static and dynamic):**
+
+1. Fetched Bradford Rodriguez's original CamelForth-for-Z80/CP-M
+   distribution (`http://www.camelforth.com/public_ftp/cam80-12.zip` — this
+   project is a direct derivative; identical file names
+   `CAMEL80.AZM`/`CAMEL80H.AZM`/etc.) and diffed `WORD`, `SCAN`, `SKIP`,
+   `INTERPRET`, `EVALUATE` against this repo's `camel80.azm`/`camel80h.azm`.
+   **They are byte-for-byte identical** to the original — nothing has been
+   altered in this shared kernel code by this project.
+2. Traced `WORD`'s algorithm by hand: `SKIP`/`SCAN` (`camel80.azm`, Z80
+   `cpi`/`cpir`-based) are **strictly bounded by the Z80 `BC` count
+   register** — they can never read past the `u` bytes handed to `WORD` by
+   `SOURCE`/`/STRING`, regardless of whether a delimiter is found before the
+   end of the given range or not (the "not found" case correctly falls back
+   to "word extends to end of given range", consuming exactly the remaining
+   length — verified this is exactly what the `DUP,qbranch,WORD1,ONEMINUS`
+   dance in `WORD` computes). No over-read is possible by construction.
+3. Built the Z80 emulation harness described above and dynamically tested,
+   both via a single isolated `EVALUATE(addr,64)` call and via the *real*,
+   fully end-to-end compiled `LOAD` word (16-line loop, real `BDOS`-served
+   block content):
+   - Words/numbers padded with trailing spaces vs. filling exactly to
+     column 64 (both directions, many lengths).
+   - A totally blank last line; an entire block of blank lines.
+   - Colon definitions (`: NAME ... ;`) ending exactly at column 64 vs.
+     short + padded.
+   - `BASE`=10 and `BASE`=16 (blocks conventionally start `HEX`).
+   - Real production block content (`forth/blocks/00-start.fth`,
+     `01-utils.fth`) with the last line varied.
+   - Two-block sequences via the real `INIT`/`bootextend` word
+     (`LIT,0,load$extend, LIT,1,load$extend`), checking not just for a crash
+     but final stack depth and `STATE` afterward (to catch a "silent"
+     corruption that might only manifest later, not just an immediate `?`
+     error).
+   - **Every one of these passed correctly.** The only `?`/`ABORT` hits
+     encountered were confirmed to be **bugs in the test's own crafted input
+     text** (e.g. `DUP;` — no separating space before `;`, so it parses as
+     one undefined token `DUP;` — correct interpreter behaviour, not a
+     system bug), not spurious/incorrect failures.
+
+**Conclusion:** could not reproduce the reported bug in
+`EVALUATE`/`WORD`/`SCAN`/`SKIP`/`INTERPRET`; the code is provably unmodified
+from the trusted original and behaves correctly across a wide, deliberately
+adversarial battery of boundary conditions.
+
+**One real, verified (but different-directioned) limitation *was* confirmed**
+and is worth remembering: because `LOAD` calls `EVALUATE` **once per 64-byte
+line**, no token (word/number) or multi-character construct (`( comment )`,
+`S"`/`."`/`ABORT"` strings) can *span* a line boundary — each line is an
+isolated source buffer with its own independent `>IN`/`'SOURCE`. If authored
+text assumes it can "flow" past column 64 into the next line, the word gets
+truncated at the boundary and (if the truncated fragment isn't a real word or
+number) triggers the `?`/`ABORT` error path — but this requires the text to
+*reach* column 64 (mid-token), which is the **opposite** of the reported
+direction ("doesn't extend to the last character"). `io-multi.azm` already
+has a `LOADLINES` `IFDEF` toggle specifically for this class of problem
+(undefining it switches to whole-block `EVALUATE`, letting definitions span
+lines, at the cost of losing the per-line echo); `io-cpm.azm`'s
+`load$extend` has no such alternative at all currently — always per-line.
+
+**Status: open, blocked on a reproducer.** Asked for (not yet received as of
+this writing): the exact block/line content that triggers it, and what the
+observed failure actually looks like (a `?` + `ABORT`? a hang? garbled
+output?), plus confirmation this was tried against the *current*
+`io-cpm.azm`/`io-multi.azm` (post the `BLKBUF`/multi-sector-loop changes
+above) rather than an older build. **When a concrete failing case is
+available, the harness technique documented above (real compiled `LOAD`,
+synthetic canned block content, breakpoints at address `0` / `ABORT`) is the
+fastest way to pin it down** — reproduce the exact reported block content in
+the harness first, *then* start varying it, rather than guessing at
+plausible-sounding variations as this session did.
+
+### Outstanding / follow-up items noted during this session (not yet done)
+
+- `camel80.azm`'s `COLD` unconditionally calls `puts`/`introdump`
+  (debug/banner helpers), but those are only *defined* in `io-multi.azm`,
+  not `io-cpm.azm` — a `-D CPM` assembly currently fails to link unless
+  those two lines are commented out first. This is a pre-existing gap in the
+  `IFDEF CPM` separation (flagged in-source: "XXX - this needs to move to a
+  different file with all of the platform specific code in one spot"), not
+  something fixed this session (worked around for testing by temporarily
+  stubbing the two lines). Needs a real fix before a clean `-D CPM` build is
+  possible without hand-patching.
+- The CP/M build's `reset::` sizes the parameter/return stacks and user area
+  off a hard-coded `$ENDADDR EQU 8000h` (`camel80.azm`), rather than probing
+  CP/M's actual reported top-of-TPA via memory location `0006h`/`0007h` (the
+  standard CP/M convention, and what the *embedded* build's `IFDEF
+  $ENDADDR`/`ELSE` branch implies is the "normal" non-fixed-address path).
+  This is yet another instance of the same "hand-picked `8000h`" pattern
+  already fixed twice above (`BLKBUF`, `blocks.fth` `FIRST`/`LIMIT`) — worth
+  applying the same treatment here if/when CP/M systems with a smaller TPA
+  need to be supported, or if dictionary growth ever approaches `8000h`.
+- `forth/blocks/01-utils.fth` line 4 is 65 characters (one over the 64-column
+  block-screen limit) — see above. `make -B forth.blk` (full from-scratch
+  rebuild) currently fails on this file; incremental `make forth.blk` works
+  because the pre-built `01-utils.blk` is reused. Should be fixed (trim one
+  character) before anyone next needs a truly from-scratch `forth.blk`
+  rebuild.
+- `forth/blocks/10-editor.fth`'s `ZZZ` working buffer (and the larger
+  `PADDR`-based buffers built on it in later editor screens) still isn't
+  `ALLOT`-protected — see "Not fully fixed / follow-up for later" above.
+

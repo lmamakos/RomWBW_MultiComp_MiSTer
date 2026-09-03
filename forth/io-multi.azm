@@ -438,11 +438,10 @@ fcb$buf:  DS 2		; dummy handle storage (contents unused)
      DW memtord
      DW EXIT
 
-; I know this is ugly, for now
-disk$buf    EQU 8000h
-
 ; LOAD ( blk# -- )   load and interpret one 1024-byte FORTH block from
-;                    the RAM disk.
+;                    the RAM disk.  Uses BLKBUF (see camel80h.azm), the
+;                    dynamically-allocated one-block transfer buffer,
+;                    rather than a hard-coded address.
 ;
 ; Two interpretation strategies, selected at assembly time:
 ;
@@ -459,15 +458,15 @@ disk$buf    EQU 8000h
 LOADLINES EQU 1				; <- uncomment for classic per-line screen behaviour
 ;
   head load$extend,4,'LOAD',docolon
-	; pull the block into disk$buf via the MMU direct-access window
+	; pull the block into BLKBUF via the MMU direct-access window
 	DW tophys			; ( blk# -- phys-lo phys-hi )
-	DW lit,disk$buf, lit,B$BLK
+	DW BLKBUF,FETCH, lit,B$BLK
 	DW rdtomem			; ( phys-lo phys-hi c-addr count -- )
   IFDEF LOADLINES
 	; --- classic per-line screen interpretation ---
 	DW lit,10h, lit,0, xdo		; 16 lines
 LOAD1:
-	DW lit,disk$buf, II, lit,40h, STAR, PLUS  ; addr of this 64-col line
+	DW BLKBUF,FETCH, II, lit,40h, STAR, PLUS  ; addr of this 64-col line
 	DW lit,40h			; length = 64
 	DW TWODUP, CR			; ( addr len addr len ) show it below
 	DW BASE, FETCH, DECIMAL, II, DOT, BASE, STORE  ; echo line number
@@ -477,7 +476,7 @@ LOAD1:
 	DW xloop, LOAD1
   ELSE
 	; --- whole-block interpretation (definitions may span lines) ---
-	DW lit,disk$buf, lit,B$BLK
+	DW BLKBUF,FETCH, lit,B$BLK
 	DW EVALUATE
   ENDIF
 	DW EXIT
@@ -625,24 +624,24 @@ SD$IN           equ 1
     dw EXIT
 
 
-; I know this is ugly, for now
-disk$buf    EQU 8000h
-
 ; load - load and evaluate a block from the (open)
 ;        block file.   Pretty bare-bones and expected
 ;        to be replaced by a more sophisticated version
 ;        from the FORTH environment extended after loading
 ;
+; Uses BLKBUF (see camel80h.azm), the dynamically-allocated one-block
+; transfer buffer, rather than a hard-coded address.
+;
 ;     HEX
-;     : LOAD (blocknum -- ) open-file 8000 read-file
-;       10 0 DO 8000 I 40 * + 40 2DUP CR BASE @ DECIMAL I . BASE ! 3E EMIT
+;     : LOAD (blocknum -- ) open-file BLKBUF @ read-file
+;       10 0 DO BLKBUF @ I 40 * + 40 2DUP CR BASE @ DECIMAL I . BASE ! 3E EMIT
 ;       SPACE TYPE EVALUATE LOOP ;
   head load$extend,4,'LOAD',docolon
 ;    DW open$file
-;    DW LIT,disk$buf, read$file
+;    DW BLKBUF,FETCH, read$file
 ;    DW LIT,10h, LIT,0, XDO
 LOAD1:
-;    DW LIT,disk$buf, II
+;    DW BLKBUF,FETCH, II
 ;    DW LIT,40h, STAR, PLUS
 ;    DW LIT,40h, TWODUP, CR
 ;    DW BASE, FETCH, DECIMAL, II, DOT, BASE, STORE

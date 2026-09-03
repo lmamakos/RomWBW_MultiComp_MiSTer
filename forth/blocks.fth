@@ -13,15 +13,21 @@ HEX
 400 CONSTANT B/BUF
 B/BUF 2 CELLS +  CONSTANT B/REC  \ block has a 4 byte header
 
-( start blocks at 3FFF and work down XXX )
-\ 9FFF 1-  CONSTANT LIMIT  ( end of buffer memory)
-\ LIMIT B/REC #BUFF * - CONSTANT FIRST \ first buffer address
-8000 CONSTANT FIRST  ( start at 8000h and work upwards )
-FIRST B/REC #BUFF * + CONSTANT LIMIT
+\ FIRST and LIMIT mark the start/end of the block-buffer pool.  Rather
+\ than hard-coding an absolute address (which would have to be picked
+\ by hand for every target, and could silently collide with whatever
+\ else is in the dictionary), the pool is allocated dynamically -- out
+\ of whatever RAM happens to be free just past the dictionary -- once,
+\ near the end of this file (see "allocate the block-buffer pool",
+\ below), using the ordinary HERE/ALLOT mechanism.  This works
+\ unchanged whether this file is loaded on the embedded (bare-metal)
+\ system, on CP/M, or (in the future) on a RomWBW/HBIOS system.
+VARIABLE FIRST     ( -- a-addr : start of block-buffer pool )
+VARIABLE LIMIT     ( -- a-addr : end of block-buffer pool )
 
 DECIMAL
-VARIABLE PREV      FIRST  PREV !
-VARIABLE USE       FIRST  USE  !
+VARIABLE PREV                     \ set once FIRST is known, below
+VARIABLE USE                      \ set once FIRST is known, below
 VARIABLE LOWBLK                   \ presumably 0
 VARIABLE HIGHBLK    78 HIGHBLK !  \ default value blocks on disk
 VARIABLE BHNDL                    \ block file handle
@@ -38,7 +44,7 @@ HEX
 : WBLK  ( adr blk# -- )    SWAP write-file ; 
 \ ===================================================
 : UPDATE ( -- ) PREV @ @   8000 OR  PREV @ ! ;
-: +BUF ( addr1-- addr2) B/REC + DUP LIMIT = IF DROP FIRST THEN ;
+: +BUF ( addr1-- addr2) B/REC + DUP LIMIT @ = IF DROP FIRST @ THEN ;
 
 : BUFFER ( n -- addr )
   USE @ DUP >R       \ get current buffer record & Rpush
@@ -74,7 +80,7 @@ HEX
 
 : FLUSH ( -- )
   ?BLOCKS
-  FIRST
+  FIRST @
   #BUFF 0
   DO
     DUP @ 0<     \ is block updated?
@@ -87,10 +93,10 @@ HEX
 
 ( initialize/zap all the buffers )
 : EMPTY-BUFFERS ( -- )
-  FIRST LIMIT OVER - 0 FILL
+  FIRST @ LIMIT @ OVER - 0 FILL
   #BUFF 0
   DO
-    7FFF B/REC I * FIRST + !   ( store invalid [max] block number? )
+    7FFF B/REC I * FIRST @ + !   ( store invalid [max] block number? )
   LOOP ;
 
 : OPEN-BLOCKS ( file$ len -- )
@@ -110,11 +116,11 @@ HEX
   2DROP ( n -- )
   open-file  ( will create if not present )
   FCB$ BHNDL !
-  FIRST CELL+ B/BUF BL FILL
+  FIRST @ CELL+ B/BUF BL FILL
   DUP HIGHBLK !
   1+  1
   DO
-      FIRST CELL+ I WBLK
+      FIRST @ CELL+ I WBLK
   LOOP
   CLOSE-BLOCKS ;
 
@@ -133,5 +139,15 @@ DECIMAL
 : -->   ( n -- ) SCR @ 1+ LOAD ;
 
 HERE SWAP - DECIMAL  CR .  .( bytes)
+
+\ allocate the block-buffer pool -- now that every word that refers to
+\ FIRST/LIMIT (+BUF, BUFFER, BLOCK, FLUSH, EMPTY-BUFFERS, MAKE-BLOCKS)
+\ has already been defined above, HERE points just past all of this
+\ file's dictionary growth, so the pool can never collide with it.
+HERE FIRST !
+FIRST @ B/REC #BUFF * + LIMIT !
+FIRST @ DUP PREV ! USE !
+B/REC #BUFF * ALLOT
+
 EMPTY-BUFFERS
 

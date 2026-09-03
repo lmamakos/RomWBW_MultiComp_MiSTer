@@ -7,8 +7,8 @@ VARIABLE SCR 64 CONSTANT B/L
 : -->   ( n -- ) SCR @ 1+ LOAD ;
 : THRU ( blk1 blk2 -- ) 1+ SWAP DO I DUP . LOAD  LOOP ;
 : MAKE-BLOCKS 2DROP open-file FCB$ BHNDL !
-   FIRST CELL+ B/BUF BL FILL  
-   DUP HIGHBLK ! 1+  1 DO FIRST CELL+ I WBLK LOOP CLOSE-BLOCKS ;
+   FIRST @ CELL+ B/BUF BL FILL  
+ DUP HIGHBLK ! 1+  1 DO FIRST @ CELL+ I WBLK LOOP CLOSE-BLOCKS ;
 : editor ." basic block editor.." HERE 5 7 THRU 
     HERE SWAP - ." done. " . ." bytes" CR ;
 : screen ." Screen editor.. "  HERE 9 21 THRU
