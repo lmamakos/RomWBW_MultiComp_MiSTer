@@ -92,6 +92,45 @@ Output: `output_files/MultiComp.rbf`.
 **Note:** Building the HDL core typically happens via the wrapper scripts above, which invoke
 a containerized Quartus environment on `tycho` to avoid local tool dependencies.
 
+## Z-80 assembler toolchain (`forth/`, and any future Z-80 `.azm`/`.mac` work)
+
+The `forth/` directory (CamelFORTH port) is assembled with **um80/ul80**,
+a MACRO-80/LINK-80-compatible toolchain (Python package `um80`, source:
+<https://github.com/avwohl/um80_and_friends>). It is *not* preinstalled on a
+fresh environment, and a `pip install --user um80` can leave a **broken**
+`~/.local/bin/um80` shim ahead of a working copy elsewhere on `$PATH` (e.g.
+`~/um80_and_friends/bin`) — always use the wrapper scripts below rather than
+invoking `um80`/`ul80` by bare name, since they were specifically built to
+avoid that trap.
+
+```sh
+# Locate + run any tool from the toolchain (um80, ul80, ud80, ux80, ...):
+tools/z80tool.sh um80 forth/camel80.azm -D CPM -g -o /tmp/out.rel -l /tmp/out.prn
+tools/z80tool.sh ul80 -p 0 --sym -x -o /tmp/out.hex /tmp/out.rel
+
+# Thin wrappers for the two most commonly used tools:
+tools/um80.sh <args...>
+tools/ul80.sh <args...>
+
+# One-shot assemble + link + flatten-to-binary (the same recipe
+# forth/Makefile uses for camel80.bin), for one-off/exploratory builds:
+tools/z80asm.sh forth/camel80.azm                       # -> forth/camel80.{prn,sym,bin}
+tools/z80asm.sh -D CPM -o /tmp/camel80cpm forth/camel80.azm
+tools/z80asm.sh --help
+```
+
+**How the wrappers find a working toolchain:** `tools/z80tool.sh` checks
+`$Z80TOOLS_BIN/<tool>` (if set), then `~/um80_and_friends/bin/<tool>`, then
+`$PATH` — and actually **runs `<tool> --version`** on each candidate to
+confirm it works before using it, rather than trusting whichever comes first
+on `$PATH`. If none work, it prints install instructions. Set `Z80TOOLS_BIN`
+to override the search if the toolchain lives somewhere else on a given
+machine.
+
+For real, repeatable builds (not one-off exploration), prefer `forth/Makefile`
+(`cd forth && make`) over `z80asm.sh` — the Makefile is the source of truth
+for how `camel80.bin`/`forth.blk` are actually built and installed.
+
 ## Target device
 
 Cyclone V `5CSEBA6U23I7` (DE10-Nano / MiSTer).
