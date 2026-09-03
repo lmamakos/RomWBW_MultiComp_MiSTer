@@ -724,6 +724,29 @@ begin
 					-- otherwise keeps mmu_req_mem_out high across the data->
 					-- refresh boundary and makes the exit alignment-dependent
 					-- (see "M1 / REFRESH HAZARD" above).
+					--
+					-- ATTEMPTED FIX, REVERTED: a prior version of this line
+					-- added `phys_in_sdram = '0' or` to this condition,
+					-- hypothesising that INI/INIR's hard-wired write-to-(HL)
+					-- immediately after the port read (with no possible gap)
+					-- was stalling this exit on an SDRAM-irrelevant write.
+					-- On hardware this made things dramatically WORSE (1
+					-- mismatch -> 1021 out of 1024 in testing/backtoback.asm
+					-- Phase A2/A3), not better. Root cause of the failed
+					-- fix: phys_in_sdram is a continuously-computed
+					-- COMBINATIONAL signal off whatever mmu_phys_addr (i.e.
+					-- whatever the CPU's raw address bus) shows at any given
+					-- instant, with no qualification that a request is even
+					-- active; since the CPU spends the vast majority of its
+					-- time addressing block RAM (frame 0), phys_in_sdram
+					-- reads '0' almost continuously for reasons unrelated to
+					-- whether the CURRENT SDRAM transaction has genuinely
+					-- finished, causing this exit to fire far too eagerly
+					-- and unpredictably. Do NOT reintroduce this without
+					-- simulating first (see HISTORY.md's note on the
+					-- similarly-reverted cpu_wait_n_sync attempt). The
+					-- original mmu_req_read/mmu_req_write-only condition
+					-- below is restored.
 					sdram_wait_n <= '1';
 					if mmu_req_read = '0' and mmu_req_write = '0' then
 						-- Enforce the inter-request dead time before another

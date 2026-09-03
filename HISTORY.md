@@ -1368,3 +1368,515 @@ widening work, for whoever picks it up next.
    paged-memory foundation (MMU + SDRAM, with a verified direct-access
    window for inter-bank copies) is now in place to host it.
 
+---
+
+## Session update — sustained/back-to-back SDRAM access re-investigation
+
+This picks up the two OPEN items from the sections above ("Wait-line phase
+race: intermittent off-by-one on execute-from-SDRAM" and "SDRAM client FSM:
+back-to-back request deadlock"). Despite the `S_GAP` dead-time state and the
+stale-read-by-one fix already in the tree, the underlying symptom is still
+present and was re-reported directly against current hardware:
+
+- SDRAM **passes** discrete/data-only tests (`testing/sdramtest.asm`, both
+  the direct-access phase and the MMU-paged sweep) and code executes fine
+  from **block RAM**.
+- SDRAM **execution still fails/hangs or is flaky** (consistent with the
+  documented `0xC3`→`0xC4` off-by-one).
+- **Back-to-back memory cycles corrupt data**, specifically reported for a
+  rapid, repeated read of SDRAM through the MMU direct-access port (an
+  `INIR`-style access pattern) — a new, more specific report than the
+  earlier general "execute from SDRAM" symptom.
+
+### Architecture recap (for a fresh reader)
+
+The read/write path a Z-80 memory or direct-access cycle takes:
+
+```
+Z-80 (t80s, clocked by cpuClock ~10 MHz, a /5 divider off clk_sys)
+  -> MMU (Components/alancox/MMU.vhd, clk_sys 50 MHz)
+       - frame-mapped access: address_out = mmu_frame(sel) & offset
+       - direct-access (+12): address_out = pointer; single 1-cycle cpu_wait
+  -> SDRAM client FSM (MicrocomputerZ80CPM.vhd:664, clk_sys 50 MHz)
+       S_IDLE -> S_REQ -> S_DONE -> S_GAP -> S_IDLE
+       stalls the CPU (sdram_wait_n) until the controller reports `ready`
+  -> CDC adapter (MultiComp.sv:260-320, clk_sys 50 MHz <-> clk_ram)
+       level+edge-triggered handshake: cpu_req_level is 2-FF synced into
+       clk_ram and a new transaction is launched ONLY on its rising edge —
+       this requires the request level to go LOW between accesses, which is
+       exactly what S_GAP is there to guarantee.
+  -> sdram_32r8w controller (Components/SDRAM/sdram2.sv, clk_ram)
+       CAS_LATENCY=3, dual AS4C32M16SB devices, alternating refresh.
+```
+
+### New concrete finding: PLL frequency mismatch vs. documented intent
+
+`MultiComp.sv:491` has `` `define SDRAM_CLK_100 `` **enabled**, routing
+`clk_ram = clk_ram_100 = outclk_2`. But the actual generated PLL
+(`rtl/pll/pll_0002.v`) emits:
+
+```
+output_clock_frequency1("111.538461 MHz")   -- outclk_1 ("112 MHz" tap)
+output_clock_frequency2("96.666666 MHz")    -- outclk_2 ("100 MHz" tap)
+```
+
+i.e. the "100 MHz" fallback is actually running at **96.67 MHz**, not 100,
+and the "112 MHz" tap is 111.54 MHz. This is close enough that
+`CAS_LATENCY=3` and the refresh-interval constant (`cycles_per_refresh =
+390`) still hold with margin, and the `S_GAP` dead-time (3 `clk_sys` cycles)
+is still comfortably long enough for the `clk_ram` 2-FF synchroniser at
+either frequency. So this mismatch is probably **not** the root cause, but
+it should still be corrected (regenerate the PLL to the documented 112/100
+MHz) so the `clk_ram`:`clk_sys` ratio the gap arithmetic assumes is actually
+true, removing one variable from future debugging.
+
+### Ranked hypotheses for the sustained-access fault
+
+1. **Stale-read / wait-release race between the 50 MHz control logic and the
+   10 MHz derived `cpuClock` (most likely).** `cpuClock` is a free-running
+   `/5` counter (`MicrocomputerZ80CPM.vhd`, `cpuClkCount`/`cpuClock`
+   process), not a clock-enable — the T80 core's `CEN` is hardwired to `'1'`
+   in `T80s.vhd:115` and the real gating happens via the derived clock
+   itself. `sdramReadData` and `sdram_wait_n` are both driven at 50 MHz
+   (`clk_sys`), but the Z-80 only samples them at `cpuClock` edges
+   (10 MHz, 3/5 duty cycle). Under a **single, isolated** access there is
+   comfortable slack (this is why discrete probes and the paged sweep
+   pass). Under **back-to-back** access, successive transactions complete
+   at different phases of the 5-cycle `cpuClock` window, and if a
+   transaction's data-latch/wait-release lands unfavourably relative to the
+   next `cpuClock` sampling edge, the CPU can capture a stale (previous
+   transaction's) byte. This exactly matches the documented `0xC3`→`0xC4`
+   off-by-one and the newly reported `INIR` corruption. A previous attempt
+   to fix this by deferring the wait release to the `cpuClock`-low phase
+   was **reverted as a regression** (it applied to *every* cycle, not just
+   SDRAM ones, and broke normal boot) — see "Wait-line phase race" above.
+   The fix must be re-attempted **gated strictly to `phys_in_sdram`** so
+   non-SDRAM cycles are provably untouched.
+2. **`S_GAP` dead-time margin under real `INIR` cadence.** The gap (3
+   `clk_sys` cycles low) was sized against consecutive M1 opcode fetches
+   from SDRAM. `INIR`'s cadence (read, write, decrement/branch) has not been
+   specifically measured against the gap; if the *effective* low-time seen
+   by the `clk_ram` synchroniser is shorter than assumed under this
+   instruction's real timing, the request-level rising edge could still be
+   missed (dropped request → stale/repeated data rather than a hard hang,
+   depending on exactly where in the sequence it happens).
+3. **Direct-access (I/O port `+12`) sustained-read path may differ from the
+   frame-mapped sustained-read path.** The MMU's direct-access mechanism
+   issues only a single `cpu_wait` pulse itself (`MMU.vhd:230`) and relies
+   entirely on the SDRAM FSM's `sdram_wait_n` for the rest of the stall;
+   worth confirming this behaves identically under sustained access to the
+   normal frame-mapped memory path used by `LD (HL),A`/`LDIR` (which is
+   known to pass in `sdramtest.asm` Phase 2).
+4. **`ram_done` toggle-handshake fragility under tightly-spaced
+   completions** (`MultiComp.sv:285-320`). The completion flag is a level
+   that toggles once per transaction and is recovered on the `clk_sys` side
+   via a 2-FF sync + XOR edge detector. This is a standard, generally robust
+   pattern, but has not been proven against the *specific* cadence `INIR`
+   produces; listed for completeness / SignalTap confirmation rather than as
+   the leading suspect.
+
+### New diagnostic: `testing/backtoback.asm`
+
+To convert "we think it's the sustained-read path" into a definitive,
+hardware-runnable, localized result, a new standalone test was added
+(modeled on `sdramtest.asm`/`sdramexec.asm`'s structure and print helpers).
+It runs from **block RAM** (OSD "Boot Load Target = Block RAM") and reports
+PASS/FAIL with the first bad byte's offset/expected/got, per phase, over the
+serial console (ACIA `io2`, `0x82`/`0x83`).
+
+Layout: frame 0 (block RAM, physical page 8192) holds the code, scratch, a
+1024-byte golden ramp buffer (`GOLD_BASE = 0x2000`) and a 1024-byte LDIR
+work buffer (`WORK_BASE = 0x2400`); frame 1 is mapped to SDRAM physical page
+`TESTPAGE = 4` (physical `0x010000`) at logical `0x4000`, matching the
+direct-access pointer base (`SDB2 = 0x01` → physical `0x00010000`).
+
+- **Phase 0 (setup):** build a 1024-byte ramp (`GOLD[i] = i mod 256`) in the
+  block-RAM golden buffer, then write the *same* ramp into the SDRAM region
+  via the direct-access port (the proven single-touch write path).
+- **Phase A — direct-access SUSTAINED READ:** a tight `IN (0xBC)` loop reads
+  1024 consecutive SDRAM bytes (pointer auto-increments in hardware) and
+  compares each against the golden ramp. Directly reproduces the reported
+  `INIR`-via-direct-access corruption using the I/O-port read path.
+- **Phase B — `LDIR` SDRAM → block RAM (native read path):** copies the
+  SDRAM region into the work buffer with a single `LDIR`, then verifies the
+  buffer against the golden ramp. Exercises the same *native* memory-read
+  path that M1 instruction fetch from SDRAM depends on.
+- **Phase C — `CPIR` sentinel search (read-only sustained):** see the
+  "Phase C bug fix" note immediately below — this phase was originally
+  specified incorrectly and has been corrected.
+- **Phase D — `LDIR` block RAM → SDRAM (sustained write) + verify:** writes
+  the golden ramp into SDRAM with a single `LDIR`, reads it back with a
+  second `LDIR`, and verifies — exercising sustained SDRAM *write*
+  (`tWR`/write-recovery) as a separate axis from the read-side hypotheses
+  above.
+
+**Interpreting the pass/fail matrix:**
+
+| Result | Localization |
+|---|---|
+| A fails, B/C/D pass | Direct-access (I/O-port) SDRAM read path specifically. |
+| B and/or C fail | Native SDRAM read path (M1-fetch/execute + `CPIR`'s own microcode); consistent with the stale-read-race hypothesis (#1 above). |
+| D fails | Sustained SDRAM *write* path (`tWR`/write-recovery, or the LDIR/direct-access write path). |
+| Multiple phases fail | Shared request-level CDC (#2/#4 above) is the common root cause, not a path-specific issue. |
+| All pass | The fault is narrower than this test exercises (e.g. specific to real M1 opcode fetch timing, or the refresh-phase hazard when frame 0 itself maps to SDRAM) — extend `sdramexec.asm`-style execution testing next, or map the SDRAM page into **frame 0** to reproduce the M1-refresh-hazard worst case described earlier in this document. |
+
+Build: `pasmo --bin testing/backtoback.asm testing/backtoback.bin`. Assembles
+cleanly (2312-byte flat binary; verified with `pasmo` in this session; code +
+messages end at `0x4C4`, well clear of `SCRATCH = 0x900` and the
+`GOLD_BASE`/`WORK_BASE` buffers at `0x2000`/`0x2400`).
+
+#### Phase C bug fix: `CPIR` does not compare two memory regions
+
+The first version of Phase C was written as `ld de,GOLD_BASE` / `ld
+hl,SDRAM_WIN` / `ld bc,REGION` / `cpir`, intending a DE-vs-HL block compare
+(mirroring `REQUIREMENTS.md`'s own wording, "check whether block-compare
+fails the same way block-copy does"). **This is not what `CPIR` does.**
+Per the Z-80 instruction set, `CPI`/`CPIR` compares the accumulator (`A`)
+against `(HL)` only; it never reads `DE`, and `DE` is not advanced by the
+instruction. The original code left `DE` unused by the hardware and `A`
+holding whatever value preceding code happened to leave in it — the phase
+never validated anything and would have reported false confidence.
+
+**Fix — use `CPIR` for what it actually does.** Rather than deleting the
+phase, it was adapted into a genuine, correct sustained *search*: the golden
+ramp (`GOLD[i] = i mod 256`) naturally places the byte value `0xFF` at every
+256-byte boundary within the 1024-byte region (offsets 255, 511, 767, 1023).
+Phase C first de-duplicates this — using three isolated, single-touch
+direct-access writes (the already-proven, non-sustained write path) to
+overwrite the SDRAM copies at offsets 255/511/767 with `0xFE` — leaving
+offset `LASTOFF` (1023) as the *only* `0xFF` left in the region. A plain
+`cpir` searching for `0xFF` (`ld hl,SDRAM_WIN / ld bc,REGION / ld a,0FFh /
+cpir`) must then scan every one of the 1024 bytes back-to-back (no software
+instructions between reads — they all happen inside the single `CPIR`
+opcode) before it can find the match at the very end. Per the documented
+`CPI`/`CPIR` semantics (each iteration: compare `A` to `(HL)`, `HL++`,
+`BC--`, `Z` set iff `A==(HL)`; `CPIR` repeats while `BC!=0` and `Z=0`):
+
+- `Z=1` and `BC=0` → sentinel found on the **last** iteration exactly as
+  expected — the whole region was read back-to-back with no early false
+  match and no missed match. **PASS.**
+- `Z=1` and `BC!=0` → sentinel found **early** (some other offset read back
+  as `0xFF`) — a corrupted/stale read produced a false match. **FAIL**
+  (offset reported as `LASTOFF - BC`).
+- `Z=0` (`BC=0`) → sentinel never found — the true last byte itself did not
+  read back as `0xFF`. **FAIL.**
+
+This keeps the diagnostic value `REQUIREMENTS.md` was asking for (a second,
+*different* sustained instruction exercising the SDRAM read path — `CPIR`'s
+microcode/timing in the T80 core differs from `LDIR`'s, see
+`Components/Z80/T80_MCode.vhd`) while being technically correct about what
+the instruction does. The `pc_first` scratch flag from the old design was
+removed (this phase is single-shot: one `cpir` call, one pass/fail
+determination, not a per-byte loop needing a "first mismatch" latch).
+
+### Next steps for whoever picks this up
+
+1. **Assemble and run `testing/backtoback.asm`** (Boot Load Target = Block
+   RAM) and record which phase(s) fail, per the matrix above.
+2. If SignalTap is available, capture (triggered on the first bad byte):
+   `sdram_state`, `sdram_we_reg`/`sdram_rd_reg`, `sdram_wait_n`,
+   `cpu_wait_n`, `n_RD`/`n_WR`/`n_MREQ`, `mmu_req_mem_out`, `phys_in_sdram`,
+   and the CDC-side `cpu_req_level`/`req_sync`/`ram_req`/`sdram_cpu_ready`/
+   `ram_done` in `MultiComp.sv`.
+3. Apply the fix matching the localized hypothesis (see the ranked list
+   above); if it is the stale-read/wait-release race, gate any
+   phase-alignment change strictly to `phys_in_sdram` so the regression from
+   the earlier reverted attempt cannot recur.
+4. Regenerate the PLL (`rtl/pll.qip`) to the documented 112 MHz / 100 MHz
+   taps so `clk_ram` matches what the `S_GAP` arithmetic and comments
+   assume.
+5. Regress with **both** `testing/sdramtest.asm` (discrete) and
+   `testing/backtoback.asm` (sustained) before moving on.
+ 6. Once sustained access is solid, proceed to the arbiter + BRAM-cache
+    architecture described in `REQUIREMENTS.md` ("Memory subsystem:
+    sustained-access failures + new arbitrated/cached architecture").
+
+### Proposed speculative fixes (advance review)
+
+The four fixes below are recorded here for future reference. After the
+`backtoback.asm` run (see "Test result" immediately below), the plan is to
+apply **Fix 1 first** (see the "Next action" note at the end of this section).
+Each fix is scoped to one of the ranked hypotheses above so a single, targeted
+change can be validated at a time (do not combine them until a result tells us
+which one is needed; applying all of them at once would reintroduce the "changed
+everything, don't know what fixed it" problem, and the earlier `cpu_wait_n_sync`
+attempt *did* combine phases and became a regression).
+
+#### Test result of `testing/backtoback.asm` (run on hardware)
+
+The `backtoback.bin` image (2312-byte flat binary, built with
+`pasmo --bin testing/backtoback.asm testing/backtoback.bin`) was loaded into
+**block RAM** (OSD "Boot Load Target = Block RAM") and run. **All four
+functional phases failed**, with the very first byte of the SDRAM region
+(offset `0000`) reading back as `0x44` instead of the golden `0x00`:
+
+```
+MultiComp SDRAM back-to-back (sustained) test
+region
+PHASE 0: build golden ramp + fill SDRAM (direct-access)
+  PHASE 0 OK
+
+PHASE A: direct-access SUSTAINED READ
+    FAIL @0000 exp=00 got=44
+
+PHASE B: LDIR SDRAM->BRAM (native read path)
+    FAIL @0000 exp=00 got=44
+
+PHASE C: CPIR sentinel search (read-only sustained)
+    FAIL sentinel found EARLY @0001
+
+PHASE D: LDIR BRAM->SDRAM (sustained) + verify
+    FAIL @0000 exp=00 got=44
+
+==== VERDICT ====
+RESULT: FAILURES DETECTED (see phases above)
+```
+
+**Observations on the result:**
+
+1. **Phase 0 (the proven single-touch direct-access *write* path) passed** —
+   so the write path into the SDRAM region works for the direct-access port,
+   and the block-RAM golden ramp built there is fine.
+2. **Every read-back of the first SDRAM byte returns `0x44`, not the golden
+   `0x00`** — in Phase A (direct-access read), Phase B (`LDIR` native read),
+   and Phase D (`LDIR` read-back after write). The failing offset is `0000` in
+   all three, and the failing value is the **same** `0x44` — i.e. the first
+   byte of the region is consistently corrupted to a *fixed* value independent of
+   the three different read paths.
+3. **Phase C** (`CPIR` search for the `0xFF` sentinel) reports the sentinel
+   found **early at offset `0001`** — i.e. the second byte read back as `0xFF`
+   when it should have been `0x01`. Combined with #2, this points at a
+   *read-side* corruption of the first byte(s) of the region rather than a
+   write-path corruption (the writes themselves are what Phase 0 exercised and
+   it passed).
+
+**Interpretation against the pass/fail matrix (this document, "Interpreting the
+pass/fail matrix" table):** the row for "Multiple phases fail" states:
+
+> Multiple phases fail → **Shared request-level CDC (#2 / #4 above) is the
+> common root cause, not a path-specific issue.**
+
+That is the matrix-consistent reading: the fault is *not* isolated to one read
+path (not just the direct-access port — that would be "A fails, B/C/D pass"),
+and it is *not* a sustained-write fault (that would be "D fails"), but a
+**shared** defect on the request-level CDC handshake that corrupts the first
+byte of a sustained read sequence. This maps to ranked hypotheses **#2**
+(`S_GAP` dead-time margin under sustained cadence — a *dropped* request on the
+first sustained access, which would leave the read data latched at a stale/
+fixed value) and **#4** (the `ram_done` toggle-handshake under tightly-spaced
+completions). Hypothesis #1 (stale-read / wait-release race, the `0xC3`→
+`0xC4` off-by-one) is the *most likely* per the earlier ranking and is the
+natural first fix to try, and is in fact the one chosen next (see below); but
+note the matrix evidence leans toward the *shared* CDC (#2/#4) rather than
+strictly the phase-race (#1), so if Fix 1 does not clear offset `0000`,
+Fix 2 (and then the Fix 2b `MultiComp.sv` escalation) is the fallback path.
+
+The common, fixed `got=44` at offset 0 is notable: a constant wrong value on
+the *first* byte of a sustained read is a classic signature of the **first
+request after the FSM/`S_GAP` re-arm being dropped or reading a stale latch**,
+i.e. the request-level synchroniser in `MultiComp.sv` (`req_sync`/`req_seen`,
+`:266-301`) not re-arming for the very first sustained access — exactly the
+condition the `S_GAP` dead time exists to prevent.
+
+#### Next action
+
+Per the decision to proceed: **implement Fix 1** (the SDRAM-gated,
+phase-aligned wait release shown in "Fix 1" below) as the first attempt,
+**gated strictly to `phys_in_sdram`** (the property the reverted
+`cpu_wait_n_sync` lacked), and validate against a normal ROM/RAM cycle in
+simulation before flashing. If Fix 1 does not clear the offset-`0000`
+`0x44` failure, escalate to **Fix 2** (`S_GAP` widening, then the `2b`
+`MultiComp.sv` `req_low_confirmed` path), which is the matrix-consistent
+"shared CDC" fallback. Do **not** apply Fix 3 (direct-access-only) — the
+result shows all paths failing, not just the direct-access one. Fix 4 (PLL
+regeneration) remains an orthogonal clean-up to be done alongside, not as a
+substitute.
+
+All four fixes below (Fix 1, Fix 2 incl. 2a/2b, Fix 3, Fix 4) are retained in
+this section verbatim for future reference regardless of which one clears the
+fault.
+
+---
+
+**Fix 1 — SDRAM-gated phase-aligned wait release (Hypothesis #1: stale-read /
+wait-release race).**
+
+This is a *re-attempt* of the earlier reverted `cpu_wait_n_sync`, but this time
+**strictly gated to `phys_in_sdram`** so non-SDRAM cycles are provably untouched
+— the very property that the reverted attempt lacked (it applied to *every*
+cycle and broke normal boot).
+
+The idea: the 50 MHz FSM releases `sdram_wait_n` in `S_DONE` at an arbitrary
+`clk` edge, but the Z-80 only samples `cpuDataIn` / `cpuWait_n` on the `cpuClock`
+rising edge (a free-running `/5` of `clk`, `MicrocomputerZ80CPM.vhd:771-785`,
+3/5 duty cycle). Under back-to-back SDRAM reads the `S_DONE` release can land
+unfavourably relative to the next `cpuClock` sampling edge, so the CPU samples a
+stale byte — the documented `0xC3`→`0xC4` off-by-one.
+
+The fix holds a *second*, SDRAM-only wait line (`sdram_wait_n_phase`) that, after
+the original `S_DONE` release, keeps the CPU stalled until the **next** `cpuClock`
+rising edge. Important timing detail (from `MicrocomputerZ80CPM.vhd:775-785`):
+`cpuClkCount` counts `0..4`, and `cpuClock` is high while `cpuClkCount >= 2` and
+low while `cpuClkCount < 2`, so the **`cpuClock` rising edge is the `clk` edge
+where `cpuClkCount == 2`** (not `0`). The phase line must therefore release on
+`cpuClkCount == 2`, aligning the wait release with the edge the T80 actually
+samples. Because it is computed only from `cpuClkCount` and applied only when
+`phys_in_sdram = '1'`, ordinary ROM/RAM/I/O cycles never see it and the
+`0xC3`/normal-boot path is unchanged.
+
+Proposed shape (added near the `cpu_wait_n` combine at
+`MicrocomputerZ80CPM.vhd:334-335` and the S_DONE block at `:717-727`):
+
+```vhdl
+-- New signal: an SDRAM-only, phase-aligned wait.
+-- '0' means "still hold the CPU" for the rest of the cpuClock window.
+signal sdram_wait_n_phase   : std_logic := '1';
+signal sdram_phase_pending  : std_logic := '0';
+
+-- Combined wait into the CPU. The phase line is ANDed in ONLY for SDRAM
+-- physical addresses, so non-SDRAM cycles are provably untouched (this is the
+-- property the earlier cpu_wait_n_sync lacked).
+cpu_wait_n <= (not mmu_cpu_wait) and sdram_wait_n
+              and (sdram_wait_n_phase when phys_in_sdram = '1' else '1');
+
+-- In S_DONE, instead of releasing immediately, raise phase-pending so the
+-- release is deferred to the next cpuClock rising edge.
+--   (original line:  sdram_wait_n <= '1';  is replaced by:)
+--   sdram_wait_n      <= '1';
+--   sdram_phase_pending <= '1';
+--
+-- Phase-pending is cleared on the *next* cpuClock rising edge. From
+-- MicrocomputerZ80CPM.vhd:781-785 cpuClock is high while cpuClkCount >= 2,
+-- so the cpuClock rising edge is the clk edge where cpuClkCount == 2.
+process(clk)
+begin
+  if rising_edge(clk) then
+    if sdram_phase_pending and cpuClkCount = "000010" then
+      sdram_wait_n_phase  <= '1';   -- release on the next cpuClock rising edge
+      sdram_phase_pending <= '0';
+    end if;
+     -- (sdram_wait_n_phase is held '0' while pending; see below)
+  end if;
+end process;
+```
+
+Caveat to resolve before applying: `cpuClkCount` shares the same `clk`-driven
+process that generates `cpuClock` (both at `:771-785`), so the "next rising
+edge of `cpuClock`" is pinned to `cpuClkCount == 2` as above. If the FSM's
+`S_DONE` happens to fall *on* that same `clk` edge, the phase line must instead
+wait for the *following* `cpuClkCount == 2` (one full 5-cycle window later) —
+otherwise it releases a beat early. This must be **validated against a normal ROM
+cycle in simulation first** (the same regression guard the previous
+`cpu_wait_n_sync` attempt missed, when it applied the stall to every cycle).
+
+---
+
+**Fix 2 — Widen / adapt the `S_GAP` dead time (Hypothesis #2: gap margin under
+`INIR` cadence).**
+
+The current `S_GAP` holds the `sdram_we`/`sdram_rd` request strobes low for
+`sdram_gap_cnt = "10"` (3 `clk_sys` cycles, `MicrocomputerZ80CPM.vhd:742`).
+That was sized against consecutive M1 opcode fetches, not against `INIR`'s
+read/then-write/then-decrement cadence. If the *effective* low-time seen by the
+112 MHz 2-FF `req_sync` synchroniser (`MultiComp.sv:285-301`) is shorter than
+assumed under `INIR`, the request-level rising edge can be missed — producing a
+*dropped* request (stale/repeated data) rather than a hang.
+
+Two alternative, independently applicable sub-fixes:
+
+**2a (cheap, first try): lengthen the gap.** Change the count at `:742` from
+`"10"` (3 cycles) to `"11"` (4 cycles), or `"00"`/`"11"` depending on the
+width of `sdram_gap_cnt` (currently `unsigned(1 downto 0)`, so max 3). If 4 is
+needed, first widen the counter:
+
+```vhdl
+-- signal sdram_gap_cnt : unsigned(1 downto 0)  ->  unsigned(2 downto 0)
+signal sdram_gap_cnt    : unsigned(2 downto 0) := (others => '0');
+-- ...
+-    sdram_gap_cnt <= "10";  -- 3 clk_sys cycles of dead time
++    sdram_gap_cnt <= "011"; -- 4 clk_sys cycles of dead time
+```
+
+At ~2.2× `clk_ram`:`clk_sys`, 4 `clk_sys` cycles still guarantee ≥9 `clk_ram`
+edges sample the level low, so re-arm is safe; the only cost is one extra
+`clk_sys` stall per SDRAM access (irrelevant at 10 MHz CPU speed).
+
+**2b (robust, if 2a does not help): make the gap self-asserting off
+`req_sync`/the synced level.** Rather than a fixed count, exit `S_GAP` only
+when the *synchronised* request level in `clk_ram` has actually observed a low
+— but `req_sync` lives in `MultiComp.sv`'s `clk_ram` domain and is not currently
+exposed back to `clk_sys`. A minimal version: have `MultiComp.sv` pulse a
+`req_low_confirmed` level (set when `req_sync(1) = '0'`), synchronise it back
+into `clk_sys` (2-FF), and let `S_GAP` clear on that. This removes the
+frequency-ratio assumption entirely. This is a larger change touching
+`MultiComp.sv` and is listed as a *fallback*, not a first attempt.
+
+---
+
+**Fix 3 — Align the direct-access (`I/O port +12`) sustained-read path with the
+frame-mapped path (Hypothesis #3: direct-access vs. frame-mapped divergence).**
+
+The `INIR`-via-direct-access report suggests the MMU's `+12` direct-access
+mechanism (single self-issued `cpu_wait` pulse at `Components/alancox/MMU.vhd:230`,
+relying entirely on the FSM's `sdram_wait_n` for the rest of the stall) may
+behave differently from the frame-mapped `LD (HL),A` / `LDIR` path (known good in
+`sdramtest.asm` Phase 2). The likely divergence: the direct-access port may emit
+its *own* single-cycle `mmu_cpu_wait` on top of (or racing with) the FSM's
+`sdram_wait_n`, so on a back-to-back direct read the MMU's one-cycle wait
+"pre-arms" the next access before the FSM's `S_GAP` has elapsed, collapsing the
+gap.
+
+The fix is to make the direct-access read path **defer to the SDRAM FSM's
+wait entirely** when `phys_in_sdram = '1'`, i.e. suppress the MMU's own
+`mmu_cpu_wait` pulse for SDRAM-targeted direct accesses so the FSM is the sole
+authority on the wait line (the same single-source-of-wait the frame-mapped path
+already has). Concretely, in `MMU.vhd` where the `+12` direct port drives
+`cpu_wait`, gate that pulse with `not phys_in_sdram`:
+
+```verilog
+// (pseudo) in MMU.vhd direct-access cpu_wait driving logic:
+// before:  mmu_cpu_wait <= (direct_access && !sdram_ready) ? 1 : 0;
+// after:   mmu_cpu_wait <= (direct_access && !sdram_ready && !phys_in_sdram) ? 1 : 0;
+```
+
+This requires `phys_in_sdram` (or an equivalent "this access is SDRAM" flag) to be
+available inside the MMU. If it is not, an alternative is to add such a flag to the
+MMU input list (the physical decode already exists at
+`MicrocomputerZ80CPM.vhd:332`). **This fix is distinct from Fix 1 and Fix 2 and
+should only be applied if the `backtoback.asm` matrix shows Phase A (direct-access
+sustained read) failing while B/C/D pass** — in which case the fault is
+path-specific to the direct-access port, not a shared CDC issue.
+
+---
+
+**Fix 4 — Regenerate the PLL to the documented 112 MHz / 100 MHz taps
+(orthogonal clean-up, not a data fix).**
+
+`MultiComp.sv:491` has `` `define SDRAM_CLK_100 `` enabled, so `clk_ram` takes
+`outclk_2`. But the generated PLL (`rtl/pll/pll_0002.v`) actually emits
+`outclk_2 = 96.67 MHz` and `outclk_1 = 111.54 MHz`, not the documented 100 / 112.
+This is *probably* not the root cause (the `S_GAP` math and refresh interval still
+hold with margin at 96.67 MHz), but the `clk_ram`:`clk_sys` ratio the
+`S_GAP` dead-time arithmetic assumes is the documented one. Regenerate
+`rtl/pll.qip` via MegaWizard to the true 112/100 MHz taps so the ratio is
+exactly what the comments and Fix 2a's "≥9 `clk_ram` edges" claim assume. This is
+a no-behaviour-change-for-correct-data cleanup that removes one variable from
+future debugging; it should be done alongside, not instead of, the targeted fix.
+
+---
+
+**Application policy for the above (do not deviate):**
+
+1. Run `testing/backtoback.asm` first; do **not** apply any fix before the
+   pass/fail matrix is recorded.
+2. Apply **exactly one** fix, the one matching the matrix (A→Fix 3, B/C→Fix 1
+   with Fix 2b as escalation, D→write-path investigation, multi-phase→Fix 2).
+3. Verify the applied fix against a **normal ROM/RAM cycle in simulation**
+   (or a block-RAM boot) before flashing — the `cpu_wait_n_sync` regression
+   shows that an "SDRAM-only"-claiming change can still leak across to
+   non-SDRAM cycles if the gating is wrong.
+4. Regress with **both** `testing/sdramtest.asm` and `testing/backtoback.asm`
+   after each single fix.
+5. Keep each fix in its own commit so a regression can be isolated and reverted
+   without touching the others.
+
