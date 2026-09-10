@@ -11,6 +11,6 @@ VARIABLE SCR 64 CONSTANT B/L
  DUP HIGHBLK ! 1+  1 DO FIRST @ CELL+ I WBLK LOOP CLOSE-BLOCKS ;
 : editor ." basic block editor.." HERE 5 7 THRU 
     HERE SWAP - ." done. " . ." bytes" CR ;
-: screen ." Screen editor.. "  HERE 9 21 THRU
+: screen ." Screen editor.. "  HERE 9 20 THRU
     HERE SWAP - ." done. " . ." bytes" CR ;
-( must be at very end of a block.  )             0 0 OPEN-BLOCKS
+( must be at very end of a block.  )            0 0 OPEN-BLOCKS

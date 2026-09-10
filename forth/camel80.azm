@@ -98,12 +98,13 @@ TIBSIZE$  EQU	     512
 ; ===============================================
 
       IFDEF      CPM
+        TITLE  CAMEL80 FORTH for CP/M
         ASEG       ; this, or get rid of the ORG statement later.
         org 100h   ; CP/M ENTRY POINT
 $ENDADDR EQU       8000h    ; might be handy to have the linker manage the start address
 
       ELSE
-
+        TITLE  CAMEL80 FORTH (BOOTABLE)
         ASEG
         ORG 0000H
 RST0:	DI
@@ -246,11 +247,19 @@ reset::
         push hl
         pop iy       ;      = bottom of user area
         ld de,1      ; do reset if COLD returns
+      IFDEF CPM
+        ; io-cpm.azm has no raw-hardware 'puts'/'introdump'; those are
+        ; only defined in io-multi.azm and talk directly to the embedded
+        ; board's ACIA1 UART, which doesn't exist under CP/M (I/O there
+        ; goes through BDOS instead -- see io-cpm.azm). Skip this
+        ; embedded-only startup banner/register dump for this build.
+      ELSE
  push hl
   ld hl,hello
   call puts
   call introdump
  pop hl
+      ENDIF
 
         ld a,1       ; turn off Searle Multicomputer boot rom 
         out (38h),a  ; if that's still somehow around

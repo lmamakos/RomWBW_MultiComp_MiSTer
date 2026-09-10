@@ -6,13 +6,26 @@ MULTICOMPDEST=5:
 MULTICOMPDISK=../z80pack/cpmsim/disks/drivei.dsk
 MULTICOMPFORMAT=z80pack-hd
 
+all:	camel80.bin camel80cpm.com
+
 camel80.bin: camel80.azm camel80d.azm camel80h.azm cameltst.azm io-multi.azm
-	um80 camel80.azm -g -l camel80.prn
+	um80 camel80.azm -D BOOTABLE=1 -g -o camel80.rel -l camel80.prn
 	ul80 -p 0 --sym  -x -o camel80.hex camel80.rel && rm camel80.rel
 	objcopy -I ihex -O binary camel80.hex camel80.bin && rm camel80.hex
 
+# CP/M variant: same camel80.azm kernel, assembled with -D CPM so it
+# INCLUDEs io-cpm.azm (BDOS file I/O) instead of io-multi.azm (embedded
+# Z80 Multicomputer ROM words). Output is a flat binary with ORG 100h
+# baked in by the source (CP/M's TPA entry point) -- i.e. it can be copied
+# directly onto a CP/M disk image as CAMEL80.COM with no on-CP/M assembly
+# step required.
+camel80cpm.com: camel80.azm camel80d.azm camel80h.azm io-cpm.azm
+	um80 camel80.azm -D CPM=1 -g -o camel80cpm.rel -l camel80cpm.prn
+	ul80 -p 0 --sym  -x -o camel80cpm.hex camel80cpm.rel && rm camel80cpm.rel
+	objcopy -I ihex -O binary camel80cpm.hex camel80cpm.com && rm camel80cpm.hex
+
 clean:
-	rm -f  *.prn *.lst *.rel camel80.bin
+	rm -f  *.prn *.lst *.rel *.sym camel80.bin camel80cpm.com
 	rm -f  *~
 
 all:
